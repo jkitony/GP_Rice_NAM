@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+# Input file
+infile = "Phenos_2018_17fam_2249lines.csv"
+
+# Traits to include
+traits = ["DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR"]
+
+# Read data
+df = pd.read_csv(infile)
+
+# Keep only selected traits and force numeric
+data = df[traits].apply(pd.to_numeric, errors="coerce")
+
+# Correlation matrix
+corr = data.corr(method="pearson")
+
+# P-value matrix
+pvals = pd.DataFrame(np.ones((len(traits), len(traits))), index=traits, columns=traits)
+
+for i in range(len(traits)):
+    for j in range(len(traits)):
+        x = data[traits[i]]
+        y = data[traits[j]]
+        valid = x.notna() & y.notna()
+        if valid.sum() > 2:
+            r, p = pearsonr(x[valid], y[valid])
+            corr.iloc[i, j] = r
+            pvals.iloc[i, j] = p
+        else:
+            corr.iloc[i, j] = np.nan
+            pvals.iloc[i, j] = np.nan
+
+# Set up figure
+fig, ax = plt.subplots(figsize=(2.5, 2.5))
+
+# Colormap similar to corrplot style
+cmap = plt.cm.RdBu   # negative = red, positive = blue
+norm = Normalize(vmin=-1, vmax=1)
+
+n = len(traits)
+
+# Draw circles
+for i in range(n):
+    for j in range(n):
+        r = corr.iloc[i, j]
+        p = pvals.iloc[i, j]
+
+        # blank non-significant off-diagonal cells
+        if i != j and (pd.isna(p) or p >= 0.05):
+            continue
+
+        if pd.isna(r):
+            continue
+
+        size = abs(r) * 90  # circle size scaling
+        color = cmap(norm(r))
+
+        ax.scatter(
+            j, n - 1 - i,
+            s=size,
+            color=color,
+            edgecolors="black",
+            linewidths=0.2
+        )
+
+# Axis formatting
+ax.set_xticks(range(n))
+ax.set_yticks(range(n))
+ax.set_xticklabels(traits, rotation=90, fontsize=5)
+ax.set_yticklabels(traits[::-1], fontsize=5)
+
+ax.set_xlim(-0.5, n - 0.5)
+ax.set_ylim(-0.5, n - 0.5)
+ax.set_aspect("equal")
+
+# Grid lines to separate cells
+for k in range(n + 1):
+    ax.axhline(k - 0.5, color="lightgray", linewidth=0.3)
+    ax.axvline(k - 0.5, color="lightgray", linewidth=0.3)
+
+# Remove spines
+for spine in ax.spines.values():
+    spine.set_visible(False)
+
+# Colorbar
+sm = ScalarMappable(norm=norm, cmap=cmap)
+sm.set_array([])
+cbar = plt.colorbar(sm, ax=ax, fraction=0.046, pad=0.02)
+cbar.ax.tick_params(labelsize=5)
+
+plt.tight_layout()
+
+# Save outputs
+plt.savefig("Phenos_2018_17fam_2249lines_correlation.png", dpi=600, bbox_inches="tight")
+plt.savefig("Phenos_2018_17fam_2249lines_correlation.pdf", bbox_inches="tight")
+
+plt.show()
