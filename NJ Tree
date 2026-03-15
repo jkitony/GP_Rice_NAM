@@ -1,0 +1,255 @@
+#Final
+#!/usr/bin/env python3
+
+import numpy as np
+import pandas as pd
+from cyvcf2 import VCF
+from sklearn.impute import SimpleImputer
+from scipy.spatial.distance import pdist, squareform
+from Bio.Phylo.TreeConstruction import DistanceMatrix, DistanceTreeConstructor
+from Bio import Phylo
+
+# =========================
+# Inputs
+# =========================
+vcf_file = "SevenPopulation_TenPopulation_merged.vcf"
+meta_file = "wnamP.csv"
+out_prefix = "NJ_tree"
+
+print("[INFO] Reading VCF...")
+vcf = VCF(vcf_file)
+samples = list(vcf.samples)
+
+geno_rows = []
+for variant in vcf:
+    row = []
+    for gt in variant.genotypes:
+        a1, a2 = gt[0], gt[1]
+
+        if a1 == -1 or a2 == -1:
+            row.append(np.nan)
+        elif a1 == 0 and a2 == 0:
+            row.append(-1)
+        elif (a1 == 0 and a2 == 1) or (a1 == 1 and a2 == 0):
+            row.append(0)
+        elif a1 == 1 and a2 == 1:
+            row.append(1)
+        else:
+            row.append(np.nan)
+    geno_rows.append(row)
+
+X = np.array(geno_rows, dtype=float).T
+print(f"[INFO] Matrix shape: {X.shape[0]} samples x {X.shape[1]} markers")
+
+print("[INFO] Imputing missing genotypes...")
+imputer = SimpleImputer(strategy="mean")
+X_imp = imputer.fit_transform(X)
+
+print("[INFO] Computing pairwise distances...")
+dist_array = pdist(X_imp, metric="euclidean")
+dist_square = squareform(dist_array)
+
+lower_triangle = []
+for i in range(len(samples)):
+    lower_triangle.append(list(dist_square[i, :i+1]))
+
+dm = DistanceMatrix(names=samples, matrix=lower_triangle)
+
+print("[INFO] Building NJ tree...")
+constructor = DistanceTreeConstructor()
+tree = constructor.nj(dm)
+
+try:
+    tree.root_at_midpoint()
+except Exception:
+    pass
+
+print("[INFO] Saving Newick tree...")
+Phylo.write(tree, f"{out_prefix}.nwk", "newick")
+
+print("[INFO] Saving sample-family table...")
+meta = pd.read_csv(meta_file, index_col=0)
+meta = meta.reset_index()
+meta.columns = ["Sample"] + list(meta.columns[1:])
+
+if "Family" not in meta.columns:
+    raise ValueError("Metadata must contain a 'Family' column.")
+
+meta[["Sample", "Family"]].to_csv("sample_family.tsv", sep="\t", index=False)
+
+print("[INFO] Done.")
+print(f"  Saved: {out_prefix}.nwk")
+print("  Saved: sample_family.tsv")
+###########################################################################################
+#Plot
+#!/usr/bin/env python3
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from Bio import Phylo
+import matplotlib.colors as mcolors
+
+# =========================
+# Inputs
+# =========================
+tree_file = "NJ_tree.nwk"
+meta_file = "sample_family.tsv"
+out_prefix = "NJ_rectangular"
+
+# =========================
+# Plot settings
+# =========================
+figure_size = (3.5, 5.5)   # for testing
+dpi = 400
+
+show_labels = False
+label_fontsize = 2.0
+
+branch_lw = 0.18
+branch_alpha = 0.85
+
+# if True, tips are also colored by family
+color_tip_labels = False
+
+save_legend = True
+legend_ncol = 2
+
+family_order = [
+    "WNAM_02", "WNAM_29", "WNAM_31", "WNAM_35", "WNAM_39", "WNAM_72", "WNAM_73",
+    "WNAM_04", "WNAM_26", "WNAM_27", "WNAM_28", "WNAM_30", "WNAM_32", "WNAM_33",
+    "WNAM_34", "WNAM_36", "WNAM_40"
+]
+
+# =========================
+# Read tree and metadata
+# =========================
+tree = Phylo.read(tree_file, "newick")
+meta = pd.read_csv(meta_file, sep="\t")
+
+sample_to_family = dict(zip(meta["Sample"], meta["Family"]))
+observed_families = list(dict.fromkeys(meta["Family"].dropna().tolist()))
+families = [f for f in family_order if f in observed_families] + [f for f in observed_families if f not in family_order]
+
+cmap = plt.get_cmap("tab20")
+family_to_color = {fam: cmap(i % 20) for i, fam in enumerate(families)}
+
+# =========================
+# Helpers
+# =========================
+def majority_family(clade):
+    fams = [sample_to_family.get(t.name, None) for t in clade.get_terminals()]
+    fams = [f for f in fams if f is not None]
+    if not fams:
+        return None
+    vals, counts = np.unique(fams, return_counts=True)
+    return vals[np.argmax(counts)]
+
+def branch_label_color(label):
+    fam = sample_to_family.get(label, None)
+    return family_to_color.get(fam, "black")
+
+# color branches in-place
+for clade in tree.find_clades():
+    fam = majority_family(clade)
+    clade.color = mcolors.to_hex(family_to_color.get(fam, "#999999"))
+    clade.width = branch_lw
+
+# =========================
+# Plot
+# =========================
+fig = plt.figure(figsize=figure_size, dpi=dpi)
+ax = fig.add_subplot(111)
+
+if show_labels:
+    label_func = lambda clade: clade.name if clade.is_terminal() else None
+else:
+    label_func = lambda clade: None
+
+Phylo.draw(
+    tree,
+    axes=ax,
+    do_show=False,
+    show_confidence=False,
+    label_func=label_func
+)
+
+# make branch transparency lower if desired
+for line in ax.get_lines():
+    line.set_alpha(branch_alpha)
+    line.set_linewidth(branch_lw)
+
+# recolor text labels if used
+if show_labels and color_tip_labels:
+    for txt in ax.texts:
+        lab = txt.get_text().strip()
+        txt.set_color(branch_label_color(lab))
+        txt.set_fontsize(label_fontsize)
+
+# clean up
+ax.set_title("Neighbor-Joining Tree", fontsize=11, fontweight="bold")
+ax.set_xlabel("Genetic distance", fontsize=9, fontweight="bold")
+ax.set_ylabel("")
+ax.tick_params(axis='x', labelsize=7)
+
+plt.tight_layout()
+plt.savefig(f"{out_prefix}.png", dpi=dpi, bbox_inches="tight", facecolor="white")
+plt.savefig(f"{out_prefix}.pdf", bbox_inches="tight", facecolor="white")
+plt.close()
+
+print(f"[INFO] Saved {out_prefix}.png and {out_prefix}.pdf")
+
+# separate legend
+if save_legend:
+
+    fig_leg = plt.figure(figsize=(1.2, 1))  # temporary small height
+    ax_leg = fig_leg.add_subplot(111)
+    ax_leg.axis("off")
+
+    handles = [
+        Patch(facecolor=family_to_color[f], edgecolor='none', label=f)
+        for f in families
+    ]
+
+    legend = ax_leg.legend(
+        handles=handles,
+        title="Family",
+        loc="upper left",
+        bbox_to_anchor=(0, 1),
+        frameon=False,
+        ncol=1,
+        fontsize=7,
+        title_fontsize=8,
+        handlelength=1.0,
+        handleheight=0.8,
+        labelspacing=0.35,
+        handletextpad=0.4,
+        borderaxespad=0
+    )
+
+    # force drawing so legend size is known
+    fig_leg.canvas.draw()
+
+    # resize figure to fit legend exactly
+    bbox = legend.get_window_extent().transformed(fig_leg.dpi_scale_trans.inverted())
+    fig_leg.set_size_inches(bbox.width + 0.15, bbox.height + 0.15)
+
+    plt.savefig(
+        f"{out_prefix}_legend.png",
+        dpi=300,
+        bbox_inches="tight",
+        pad_inches=0.01,
+        facecolor="white"
+    )
+
+    plt.savefig(
+        f"{out_prefix}_legend.pdf",
+        bbox_inches="tight",
+        pad_inches=0.01,
+        facecolor="white"
+    )
+
+    plt.close()
+
+    print(f"[INFO] Saved {out_prefix}_legend.png and {out_prefix}_legend.pdf")
