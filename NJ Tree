@@ -1,3 +1,4 @@
+#Fourteen
 #Final
 #!/usr/bin/env python3
 
@@ -12,8 +13,8 @@ from Bio import Phylo
 # =========================
 # Inputs
 # =========================
-vcf_file = "SevenPopulation_TenPopulation_merged.vcf"
-meta_file = "wnamP.csv"
+vcf_file = "WNAM_merged.vcf"
+meta_file = "wnamP2.csv"
 out_prefix = "NJ_tree"
 
 print("[INFO] Reading VCF...")
@@ -80,8 +81,9 @@ meta[["Sample", "Family"]].to_csv("sample_family.tsv", sep="\t", index=False)
 print("[INFO] Done.")
 print(f"  Saved: {out_prefix}.nwk")
 print("  Saved: sample_family.tsv")
-###########################################################################################
-#Plot
+
+#####################################################################################
+#Final final
 #!/usr/bin/env python3
 
 import numpy as np
@@ -117,9 +119,8 @@ save_legend = True
 legend_ncol = 2
 
 family_order = [
-    "WNAM_02", "WNAM_29", "WNAM_31", "WNAM_35", "WNAM_39", "WNAM_72", "WNAM_73",
-    "WNAM_04", "WNAM_26", "WNAM_27", "WNAM_28", "WNAM_30", "WNAM_32", "WNAM_33",
-    "WNAM_34", "WNAM_36", "WNAM_40"
+    "WNAM_02", "WNAM_04", "WNAM_27", "WNAM_28", "WNAM_29","WNAM_30",  "WNAM_31", "WNAM_32", "WNAM_33",
+    "WNAM_34", "WNAM_35", "WNAM_36", "WNAM_39", "WNAM_40"
 ]
 
 # =========================
