@@ -1,0 +1,302 @@
+mamba create -n rice_gwas_env -c conda-forge --strict-channel-priority -y \
+  r-base=4.3 \
+  r-essentials \
+  r-dplyr \
+  r-ggplot2 \
+  r-foreach \
+  r-dosnow \
+  r-snow \
+  r-iterators \
+  r-codetools \
+  r-qtl \
+  r-qqman \
+  r-glmnet \
+  bioconductor-biobase
+
+mamba activate rice_gwas_env
+mamba install -c conda-forge r-vcfr -y
+
+R
+install.packages(c("rrBLUP"), repos = "https://cloud.r-project.org/")
+install.packages("BiocManager", repos = "https://cloud.r-project.org/")
+BiocManager::install(c("pcaMethods"), ask = FALSE, update = FALSE)
+
+
+
+library(snow)
+library(doSNOW)
+library(parallel)
+library(qtl)
+library(dplyr)
+library(ggplot2)
+library(vcfR)
+library(pcaMethods)
+library(rrBLUP)
+library(qqman)
+library(glmnet)
+
+
+Rscript rice_gwas_clean.R
+###########################################################
+###########################################################
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#!/usr/bin/env Rscript
+
+# =========================================================
+# Rice GWAS pipeline
+# Clean version for Fourteen_projected.vcf + semitrimmed_pheno.txt
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(snow)
+  library(doSNOW)
+  library(parallel)
+  library(qtl)
+  library(dplyr)
+  library(ggplot2)
+  library(vcfR)
+  library(rrBLUP)
+  library(qqman)
+  library(glmnet)
+})
+
+# =========================================================
+# User settings
+# =========================================================
+vcf_file      <- "Fourteen_projected.vcf"
+pheno_file    <- "semitrimmed_pheno.txt"
+target_year   <- 18
+trait_cols    <- 4:14          # columns in pheno after removing first column
+n_pc          <- 4
+maf_threshold <- 0.05
+fdr_threshold <- 0.05
+n_cores       <- 24
+outdir        <- "GWAS_Year18_results"
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# =========================================================
+# Parallel backend
+# =========================================================
+cat("Detected cores:", detectCores(), "\n")
+cl <- makeCluster(n_cores, type = "SOCK")
+registerDoSNOW(cl)
+
+# Ensure cluster is stopped on exit
+on.exit({
+  try(stopCluster(cl), silent = TRUE)
+}, add = TRUE)
+
+# =========================================================
+# 1. Read VCF
+# =========================================================
+cat("Reading VCF...\n")
+vcf <- read.vcfR(vcf_file)
+
+cat("Extracting genotype matrix...\n")
+gt    <- extract.gt(vcf)
+chrom <- getCHROM(vcf)
+pos   <- getPOS(vcf)
+
+# =========================================================
+# 2. Convert genotype calls to numeric matrix
+#    0/0 = -1, 0/1 or 1/0 = 0, 1/1 = 1
+# =========================================================
+cat("Converting genotypes to numeric scores...\n")
+gt.score <- matrix(NA_real_, nrow = nrow(gt), ncol = ncol(gt))
+
+gt.score[gt %in% c("0/0", "0|0")] <- -1
+gt.score[gt %in% c("0/1", "1/0", "0|1", "1|0")] <- 0
+gt.score[gt %in% c("1/1", "1|1")] <- 1
+
+rownames(gt.score) <- rownames(gt)   # markers
+colnames(gt.score) <- colnames(gt)   # samples
+
+# transpose: rows = samples, cols = markers
+gt.score <- t(gt.score)
+
+cat("Genotype matrix dimensions (samples x markers): ", dim(gt.score)[1], " x ", dim(gt.score)[2], "\n", sep = "")
+
+# =========================================================
+# 3. Read phenotype data
+# =========================================================
+cat("Reading phenotype data...\n")
+Pheno_data <- read.table(pheno_file, header = TRUE, stringsAsFactors = FALSE)
+
+Year_data <- subset(Pheno_data, Year == target_year)
+
+if (nrow(Year_data) == 0) {
+  stop("No phenotype records found for Year == ", target_year)
+}
+
+# first column assumed to be genotype/line ID
+pheno <- Year_data[, -1, drop = FALSE]
+rownames(pheno) <- Year_data[, 1]
+
+Y <- pheno[, trait_cols, drop = FALSE]
+
+# Impute missing trait values with trait mean
+for (j in seq_len(ncol(Y))) {
+  Y[is.na(Y[, j]), j] <- mean(Y[, j], na.rm = TRUE)
+}
+
+cat("Phenotype matrix dimensions (lines x traits): ", dim(Y)[1], " x ", dim(Y)[2], "\n", sep = "")
+
+# =========================================================
+# 4. Match genotype and phenotype samples
+# =========================================================
+common_ids <- intersect(rownames(gt.score), rownames(Y))
+
+if (length(common_ids) == 0) {
+  stop("No overlapping sample IDs between genotype and phenotype data.")
+}
+
+cat("Number of matched lines:", length(common_ids), "\n")
+
+gt.score.wp <- gt.score[common_ids, , drop = FALSE]
+Y           <- Y[common_ids, , drop = FALSE]
+
+# =========================================================
+# 5. Prepare genotype dataframe for rrBLUP::GWAS
+#    rows = markers
+#    cols = marker, chrom, pos, then one column per sample
+# =========================================================
+cat("Preparing genotype table for rrBLUP GWAS...\n")
+g <- data.frame(
+  marker = colnames(gt.score.wp),
+  chrom  = as.numeric(chrom),
+  pos    = as.numeric(pos),
+  t(gt.score.wp),
+  check.names = FALSE
+)
+
+# sanity check
+if (nrow(g) != ncol(gt.score.wp)) {
+  stop("Mismatch between number of markers in g and gt.score.wp")
+}
+
+# =========================================================
+# 6. Kinship matrix
+# =========================================================
+cat("Calculating additive relationship matrix...\n")
+amat <- A.mat(gt.score.wp, shrink = TRUE)
+colnames(amat) <- rownames(amat) <- rownames(gt.score.wp)
+
+# =========================================================
+# 7. Trait-by-trait GWAS
+# =========================================================
+trait_names <- colnames(Y)
+
+for (traitName in trait_names) {
+  cat("\nRunning GWAS for:", traitName, "\n")
+
+  # phenotype for current trait
+  p <- data.frame(
+    gid = rownames(Y),
+    y   = Y[, traitName],
+    stringsAsFactors = FALSE
+  )
+
+  # run GWAS
+  gwa <- GWAS(
+    pheno   = p,
+    geno    = g,
+    K       = amat,
+    n.PC    = n_pc,
+    min.MAF = maf_threshold,
+    plot    = FALSE
+  )
+
+  # replace 0 with NA in -log10(P)
+  gwa$y[gwa$y == 0] <- NA
+
+  # build Manhattan input
+  mht <- data.frame(
+    SNP = gwa$marker,
+    CHR = gwa$chrom,
+    BP  = gwa$pos,
+    P   = 10^(-gwa$y)
+  )
+
+  mht <- na.omit(mht)
+
+  # FDR
+  fdr <- p.adjust(mht$P, method = "BH")
+  sig <- mht[fdr < fdr_threshold, , drop = FALSE]
+  sig$FDR <- fdr[fdr < fdr_threshold]
+
+  # save full results
+  gwa_out <- gwa
+  gwa_out$P <- 10^(-gwa_out$y)
+  write.table(
+    gwa_out,
+    file = file.path(outdir, paste0(traitName, "_GWAS_full.tsv")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+
+  # save Manhattan table
+  write.table(
+    mht,
+    file = file.path(outdir, paste0(traitName, "_Manhattan_input.tsv")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+
+  # save significant hits
+  write.table(
+    sig,
+    file = file.path(outdir, paste0("QTLs_", traitName, ".tsv")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+
+  # Manhattan plot
+  png(
+    filename = file.path(outdir, paste0(traitName, "_manhattan.png")),
+    width = 3000, height = 2400, res = 300
+  )
+  manhattan(
+    mht,
+    highlight = if (nrow(sig) > 0) sig$SNP else NULL,
+    ylim = c(0, 12),
+    cex.axis = 1.2,
+    cex.lab = 1.5,
+    font.lab = 2,
+    font.axis = 2,
+    genomewideline = FALSE,
+    suggestiveline = TRUE,
+    ylab = "-Log10(P-value)",
+    main = traitName
+  )
+  dev.off()
+
+  # QQ plot
+  png(
+    filename = file.path(outdir, paste0(traitName, "_QQ.png")),
+    width = 1800, height = 1800, res = 300
+  )
+  qq(
+    mht$P,
+    main = traitName,
+    cex.axis = 1.2,
+    cex.lab = 1.5,
+    font.lab = 2,
+    font.axis = 2,
+    ylab = "Observed -Log10(P)",
+    xlab = "Expected -Log10(P)"
+  )
+  dev.off()
+
+  cat("Finished:", traitName, "\n")
+  cat("Significant markers at FDR <", fdr_threshold, ":", nrow(sig), "\n")
+}
+
+cat("\nAll traits completed.\n")
+
+###########################################################
+###########################################################
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
