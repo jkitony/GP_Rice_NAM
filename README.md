@@ -3,7 +3,7 @@
 ## Overview
 This repository contains code and workflows for evaluating **genomic prediction (GP)** and **genome-wide association studies (GWAS)** in an **aus-derived nested association mapping (NAM) population in rice**.
 
-The study compares **low-density GBS markers** and **high-density projected SNPs** to assess their impact on prediction accuracy and mapping resolution.
+The study compares **low-density GBS markers** and **high-density projected SNPs** from whole genome sequence (WGS) of parents to assess their impact on prediction accuracy and mapping resolution.
 
 ---
 
