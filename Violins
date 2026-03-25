@@ -170,3 +170,125 @@ plt.savefig("NAM_11traits_violin_panels_FINAL.png", dpi=300, bbox_inches="tight"
 plt.savefig("NAM_11traits_violin_panels_FINAL.pdf", bbox_inches="tight")
 
 plt.show()
+##########################################################################################
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+# =====================
+# Input
+# =====================
+file = "Phenos_2018_14fam_1822lines.csv"
+df = pd.read_csv(file)
+
+trait = "DTH"
+
+parent_lookup = {
+    2: "WRC02", 4: "WRC04", 27: "WRC27", 28: "WRC28",
+    29: "WRC29", 30: "WRC30", 31: "WRC31", 32: "WRC32",
+    33: "WRC33", 34: "WRC34", 35: "WRC35", 36: "WRC36",
+    39: "WRC39", 40: "WRC40"
+}
+
+family_order = list(parent_lookup.keys())
+family_labels = [f"F{f}" for f in family_order]
+
+# =====================
+# Clean data
+# =====================
+df["Family"] = pd.to_numeric(df["Family"], errors="coerce")
+df[trait] = pd.to_numeric(df[trait], errors="coerce")
+df = df[df["Family"].isin(family_order)].copy()
+
+# Impute missing
+df[trait] = df.groupby("Family")[trait].transform(lambda x: x.fillna(x.mean()))
+df[trait] = df[trait].fillna(df[trait].mean())
+
+# =====================
+# T65
+# =====================
+t65_rows = df[df["Genotype"] == "T65"]
+t65_value = t65_rows[trait].mean() if not t65_rows.empty else df[trait].mean()
+
+# =====================
+# Collect data
+# =====================
+violin_data = []
+family_means = []
+parent_vals = []
+
+for fam in family_order:
+    fam_df = df[df["Family"] == fam]
+    vals = fam_df[trait].dropna().values
+    violin_data.append(vals)
+
+    fam_mean = np.mean(vals)
+    family_means.append(fam_mean)
+
+    parent_name = parent_lookup[fam]
+    parent_row = fam_df[fam_df["Genotype"] == parent_name]
+
+    if not parent_row.empty:
+        parent_vals.append(parent_row[trait].mean())
+    else:
+        parent_vals.append(fam_mean)
+
+positions = np.arange(1, len(family_order) + 1)
+
+# =====================
+# Plot
+# =====================
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+
+vp = ax.violinplot(
+    violin_data,
+    positions=positions,
+    widths=0.8,
+    showmeans=False,
+    showmedians=False,
+    showextrema=False
+)
+
+for body in vp["bodies"]:
+    body.set_facecolor("lightgray")
+    body.set_edgecolor("black")
+    body.set_alpha(1)
+
+# overlays
+ax.scatter(positions, family_means, color="black", s=25, zorder=3)
+ax.scatter(positions, parent_vals, color="blue", s=28, zorder=4)
+ax.scatter(positions, [t65_value]*len(positions), color="red", s=28, zorder=4)
+
+# axes
+ax.set_xticks(positions)
+ax.set_xticklabels(family_labels, rotation=45, fontsize=12, fontweight="bold")
+ax.set_ylabel("Days to heading", fontsize=12, fontweight="bold")
+ax.tick_params(axis='y', labelsize=12)
+plt.setp(ax.get_yticklabels(), fontweight='bold')
+
+# spines
+for spine in ax.spines.values():
+    spine.set_linewidth(1)
+
+# =====================
+# Horizontal legend (top)
+# =====================
+legend = ax.legend(
+    handles=legend_elements,
+    loc="upper center",
+    bbox_to_anchor=(0.55, 0.95),
+    ncol=3,
+    frameon=False,
+    fontsize=12
+)
+
+# Now make text bold
+for text in legend.get_texts():
+    text.set_fontweight("bold")
+
+
+plt.tight_layout()
+plt.savefig("DTH_violin_clean.png", dpi=300, bbox_inches="tight")
+plt.savefig("DTH_violin_clean.pdf", bbox_inches="tight")
+plt.show()
