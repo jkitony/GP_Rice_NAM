@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 # =====================
 # Input
 # =====================
-file = "Phenos_2018_17fam_2249lines.csv"
+file = "Phenos_2018_14fam_1822lines.csv"
 df = pd.read_csv(file)
 
 traits = ["DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR"]
@@ -13,7 +13,6 @@ traits = ["DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR"
 parent_lookup = {
     2: "WRC02",
     4: "WRC04",
-    26: "WRC26",
     27: "WRC27",
     28: "WRC28",
     29: "WRC29",
@@ -25,9 +24,7 @@ parent_lookup = {
     35: "WRC35",
     36: "WRC36",
     39: "WRC39",
-    40: "WRC40",
-    72: "WRC72",
-    73: "WRC73"
+    40: "WRC40"
 }
 
 family_order = list(parent_lookup.keys())
@@ -112,40 +109,64 @@ for i, tr in enumerate(traits):
         body.set_alpha(1)
 
     # Black dots = family means
-    ax.scatter(positions, family_means, color="black", s=24, zorder=3, label="Family mean" if i == 0 else "")
+    ax.scatter(positions, family_means, color="black", s=30, zorder=3)
 
     # Blue dots = parents
-    ax.scatter(positions, parent_vals, color="blue", s=28, zorder=4, label="Parent" if i == 0 else "")
+    ax.scatter(positions, parent_vals, color="blue", s=35, zorder=4)
 
     # Red dots = T65
-    ax.scatter(positions, [t65_values[tr]] * len(positions), color="red", s=28, zorder=4, label="T65" if i == 0 else "")
+    ax.scatter(positions, [t65_values[tr]] * len(positions),
+               color="red", s=35, zorder=4)
+
+    # ===== Bold x-axis labels =====
+    ax.set_xticks(positions)
+    ax.set_xticklabels(family_labels, rotation=90)
+
+    for label in ax.get_xticklabels():
+        label.set_fontweight("bold")
+        label.set_color("black")
+        label.set_fontsize(9)
 
     ax.set_title(tr, fontsize=12, fontweight="bold")
-    ax.set_xticks(positions)
-    ax.set_xticklabels(family_labels, rotation=90, fontsize=7, fontweight="bold", color="black")
-    ax.tick_params(axis='y', labelsize=8)
 
     for spine in ax.spines.values():
         spine.set_visible(True)
         spine.set_linewidth(1)
 
-# Remove unused 12th panel
-for j in range(len(traits), len(axes)):
-    fig.delaxes(axes[j])
+# ======================
+# Use last empty panel for legend
+# ======================
+legend_ax = axes[len(traits)]
+legend_ax.axis("off")
 
-handles, labels = axes[0].get_legend_handles_labels()
-fig.legend(
-    handles, labels,
-    loc="upper center",
-    ncol=3,
+from matplotlib.lines import Line2D
+
+legend_elements = [
+    Line2D([0], [0], marker='o', color='w', label='Parent',
+           markerfacecolor='blue', markersize=8),
+    Line2D([0], [0], marker='o', color='w', label='T65',
+           markerfacecolor='red', markersize=8),
+    Line2D([0], [0], marker='o', color='w', label='Family mean',
+           markerfacecolor='black', markersize=8)
+]
+
+legend_ax.legend(
+    handles=legend_elements,
+    loc='center',
     frameon=False,
-    fontsize=26,        # bigger text
-    markerscale=1.8     # bigger dots in legend
+    fontsize=12
 )
 
-fig.suptitle("", fontsize=16, fontweight="bold", y=0.98)
+# Remove any extra panels beyond legend
+for j in range(len(traits) + 1, len(axes)):
+    fig.delaxes(axes[j])
+
+fig.suptitle("Trait distributions across NAM families",
+             fontsize=16, fontweight="bold", y=0.98)
+
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 
-plt.savefig("NAM_11traits_violin_panels.png", dpi=300, bbox_inches="tight")
-plt.savefig("NAM_11traits_violin_panels.pdf", bbox_inches="tight")
+plt.savefig("NAM_11traits_violin_panels_FINAL.png", dpi=300, bbox_inches="tight")
+plt.savefig("NAM_11traits_violin_panels_FINAL.pdf", bbox_inches="tight")
+
 plt.show()
