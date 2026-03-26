@@ -1,0 +1,198 @@
+# =========================================================
+# AUTOMATED PCA PLOTS (multiple PC combinations)
+# =========================================================
+
+library(vcfR)
+library(pcaMethods)
+library(dplyr)
+library(ggplot2)
+library(grid)
+
+rm(list = ls())
+
+# -------------------------
+# 1. Output folder
+# -------------------------
+outdir <- "PCA_plots"
+if (!dir.exists(outdir)) dir.create(outdir)
+
+# -------------------------
+# 2. Read VCF
+# -------------------------
+vcf <- read.vcfR("Fourteen.vcf")
+gt  <- extract.gt(vcf)
+
+# -------------------------
+# 3. Genotype conversion
+# -------------------------
+gt.score <- matrix(NA, nrow = nrow(gt), ncol = ncol(gt))
+
+gt.score[gt == "0/0"] <- -1
+gt.score[gt == "0/1"] <-  0
+gt.score[gt == "1/1"] <-  1
+
+gt.score[gt == "0|0"] <- -1
+gt.score[gt == "0|1"] <-  0
+gt.score[gt == "1|0"] <-  0
+gt.score[gt == "1|1"] <-  1
+
+rownames(gt.score) <- rownames(gt)
+colnames(gt.score) <- colnames(gt)
+
+trans <- t(gt.score)
+
+# -------------------------
+# 4. PCA
+# -------------------------
+pca_res <- pca(trans, method = "ppca", nPcs = 6)
+
+pca_scores <- as.data.frame(scores(pca_res))
+pca_scores$Sample <- rownames(pca_scores)
+
+# -------------------------
+# 5. Variance explained
+# -------------------------
+eig_vals <- pca_res@sDev^2
+var_exp  <- eig_vals / sum(eig_vals) * 100
+
+# -------------------------
+# 6. Merge metadata
+# -------------------------
+P <- read.csv("wnamP2.csv", row.names = 1)
+P$Sample <- rownames(P)
+
+df <- merge(pca_scores, P, by = "Sample")
+
+df$Family <- factor(
+  df$Family,
+  levels = c(
+    "WNAM_02", "WNAM_04", "WNAM_27", "WNAM_28",
+    "WNAM_29", "WNAM_30", "WNAM_31", "WNAM_32",
+    "WNAM_33", "WNAM_34", "WNAM_35", "WNAM_36",
+    "WNAM_39", "WNAM_40"
+  )
+)
+
+df <- df %>%
+  filter(!is.na(Family)) %>%
+  droplevels()
+
+# ellipse-safe dataset
+ellipse_df <- df %>%
+  group_by(Family) %>%
+  filter(n() >= 3) %>%
+  ungroup()
+
+# -------------------------
+# 7. Aesthetics
+# -------------------------
+family_shapes <- c(
+  "WNAM_02" = 0,  "WNAM_04" = 3,  "WNAM_27" = 2,  "WNAM_28" = 12,
+  "WNAM_29" = 4,  "WNAM_30" = 5,  "WNAM_31" = 6,  "WNAM_32" = 7,
+  "WNAM_33" = 8,  "WNAM_34" = 9,  "WNAM_35" = 10, "WNAM_36" = 11,
+  "WNAM_39" = 1,  "WNAM_40" = 13
+)
+
+family_colors <- c(
+  "WNAM_02" = "magenta",      "WNAM_04" = "coral4",
+  "WNAM_27" = "yellowgreen",  "WNAM_28" = "aquamarine3",
+  "WNAM_29" = "cornflowerblue","WNAM_30" = "darkorchid2",
+  "WNAM_31" = "lightcoral",   "WNAM_32" = "cyan",
+  "WNAM_33" = "violet",       "WNAM_34" = "green",
+  "WNAM_35" = "cornsilk4",    "WNAM_36" = "black",
+  "WNAM_39" = "cornsilk2",    "WNAM_40" = "cyan4"
+)
+
+# -------------------------
+# 8. Function to generate plot
+# -------------------------
+make_pca_plot <- function(pcx, pcy) {
+  
+  xvar <- paste0("PC", pcx)
+  yvar <- paste0("PC", pcy)
+  
+  xlab_txt <- paste0(xvar, " (", round(var_exp[pcx],1), "%)")
+  ylab_txt <- paste0(yvar, " (", round(var_exp[pcy],1), "%)")
+  
+  p <- ggplot(df, aes_string(x = xvar, y = yvar, color = "Family", shape = "Family")) +
+    
+    stat_ellipse(
+      data = ellipse_df,
+      aes(group = Family),
+      type = "norm",
+      level = 0.68,
+      linewidth = 0.4,
+      show.legend = FALSE
+    ) +
+    
+    geom_point(size = 1.2, stroke = 0.4) +
+    
+    xlab(xlab_txt) +
+    ylab(ylab_txt) +
+    
+    scale_shape_manual(values = family_shapes, drop = FALSE) +
+    scale_color_manual(values = family_colors, drop = FALSE) +
+    
+    coord_cartesian(clip = "off") +
+    
+    theme_classic() +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6),
+      axis.line = element_blank(),
+      axis.title = element_text(size = 7, face = "bold"),
+      axis.text  = element_text(size = 6, face = "bold"),
+      legend.position = "right",
+      legend.title = element_blank(),
+      legend.text = element_text(size = 5, face = "bold"),
+      legend.key.height = unit(0.12, "in"),
+      plot.margin = margin(3,3,3,3)
+    ) +
+    
+    guides(
+      color = "none",
+      shape = guide_legend(ncol = 1, override.aes = list(size = 2))
+    )
+  
+  return(p)
+}
+
+# -------------------------
+# 9. PC combinations
+# -------------------------
+pc_pairs <- list(
+  c(1,2),
+  c(1,3),
+  c(2,3),
+  c(3,4),
+  c(4,5)
+)
+
+# -------------------------
+# 10. Generate and save plots
+# -------------------------
+for (pair in pc_pairs) {
+  
+  pcx <- pair[1]
+  pcy <- pair[2]
+  
+  plot_obj <- make_pca_plot(pcx, pcy)
+  
+  fname <- paste0("PCA_PC", pcx, "_vs_PC", pcy)
+  
+  # PDF
+  pdf(file.path(outdir, paste0(fname, ".pdf")), width = 3.2, height = 2.2)
+  print(plot_obj)
+  dev.off()
+  
+  # PNG
+  png(file.path(outdir, paste0(fname, ".png")),
+      width = 3.2, height = 2.2, units = "in", res = 600)
+  print(plot_obj)
+  dev.off()
+}
+
+# -------------------------
+# 11. Summary
+# -------------------------
+cat("Variance explained:\n")
+print(round(var_exp[1:5],1))
