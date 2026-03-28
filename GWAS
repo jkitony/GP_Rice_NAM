@@ -8,9 +8,127 @@ bcftools view -R subset_5000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_p
 bcftools view -R subset_10000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_10k.vcf.gz
 bcftools view -R subset_20000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_20k.vcf.gz
 bcftools view -R subset_40000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_40k.vcf.gz
+#########################################################################################################
+#!/usr/bin/env python3
+
+import pandas as pd
+import numpy as np
+
+# -----------------------------
+# Settings
+# -----------------------------
+input_file = "projected_markers.tsv"
+target_sizes = [5000, 10000, 20000, 40000]
+seed = 42
+
+# -----------------------------
+# Read marker table
+# -----------------------------
+df = pd.read_csv(input_file, sep="\t", header=None, names=["CHROM", "POS", "ID"])
+
+# If ID is missing, create fallback IDs as CHROM:POS
+df["ID"] = df["ID"].astype(str)
+mask = df["ID"].isin([".", "nan", "None", ""])
+df.loc[mask, "ID"] = (
+    df.loc[mask, "CHROM"].astype(str) + ":" + df.loc[mask, "POS"].astype(str)
+)
+
+total_markers = len(df)
+print(f"Total markers: {total_markers}")
+
+# Marker count per chromosome
+chr_counts = df["CHROM"].value_counts().sort_index()
+print("\nMarkers per chromosome:")
+print(chr_counts)
+
+rng = np.random.default_rng(seed)
+
+for target in target_sizes:
+    print(f"\nCreating subset: {target}")
+
+    sampled_parts = []
+
+    # proportional allocation by chromosome
+    for chrom, subdf in df.groupby("CHROM", sort=False):
+        n_chr = len(subdf)
+        n_take = round(target * n_chr / total_markers)
+
+        # ensure at least 1 marker per chromosome if possible
+        if n_take == 0 and n_chr > 0:
+            n_take = 1
+
+        n_take = min(n_take, n_chr)
+
+        sampled_idx = rng.choice(subdf.index, size=n_take, replace=False)
+        sampled_parts.append(df.loc[sampled_idx])
+
+    sampled = pd.concat(sampled_parts, axis=0)
+
+    # adjust if rounding causes mismatch
+    if len(sampled) > target:
+        sampled = sampled.sample(n=target, random_state=seed)
+    elif len(sampled) < target:
+        remaining = df.loc[~df.index.isin(sampled.index)]
+        add_n = min(target - len(sampled), len(remaining))
+        if add_n > 0:
+            extra = remaining.sample(n=add_n, random_state=seed)
+            sampled = pd.concat([sampled, extra], axis=0)
+
+    sampled = sampled.drop_duplicates(subset=["CHROM", "POS"])
+    sampled = sampled.sort_values(["CHROM", "POS"])
+
+    # write region file for bcftools view -R
+    sampled[["CHROM", "POS"]].to_csv(
+        f"subset_{target}.regions",
+        sep="\t",
+        header=False,
+        index=False
+    )
+
+    # write marker IDs
+    sampled["ID"].to_csv(
+        f"subset_{target}.ids.txt",
+        sep="\t",
+        header=False,
+        index=False
+    )
+
+    print(f"  Final markers written: {len(sampled)}")
+############
+###########
+Total markers: 78154
+
+Markers per chromosome:
+CHROM
+1     13293
+2     10049
+3     17143
+4       590
+5      5453
+6      5601
+7      4003
+8      2787
+9      3697
+10     6743
+11     3191
+12     5604
+Name: count, dtype: int64
+
+Creating subset: 5000
+  Final markers written: 5000
+
+Creating subset: 10000
+  Final markers written: 10000
+
+Creating subset: 20000
+  Final markers written: 20000
+
+Creating subset: 40000
+  Final markers written: 40000
+
 
 ##########################################################################################################
-
+#GWAS running
 
 #windows
 rm(list = ls())
