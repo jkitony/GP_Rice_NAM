@@ -1,0 +1,57 @@
+#Install and Export BWA,TASSEL and VCF tools to path
+#create superdirectory gbsFeb then four sub-directories reference, scripts,results/${name} and raw
+#Store fastq files(/WNAM39/WNAM39_1_fastq.txt.gz)and key files(/WNAM39/WNAM39_1_key.txt,/WNAM39/WNAM39_Pedigree.txt)
+#Rename this script with population name  that you want to analyze e.g WNAM39.sh and save in script sub-folder
+#cd the script directory then make script executable >>> chmod +x WNAM39.sh
+#run the script >>>./WNAM39.sh
+
+#################################################################################################################
+#Declare variables
+#################################################################################################################
+name=WNAM02
+enzyme=KpnI-MspI
+seqDir=/linuxhome/kitony/gbsFeb/raw/WNAM02
+keyFile=/linuxhome/kitony/gbsFeb/raw/WNAM02/WNAM02_1_key.txt
+dbPath=/linuxhome/kitony/gbsFeb/results
+
+
+###################################################################################################################
+#No need to edit from here unless tweaking plugin options or muting BWA index creation
+####################################################################################################################
+#step1: gbsSeqToTagDBPlugin
+perl ~/TASSEL5/run_pipeline.pl -Xmx20g -fork1 -GBSSeqToTagDBPlugin -db ~/gbsFeb/results/${name}.db -i ~/gbsFeb/raw/${name} -k ${keyFile} -e ${enzyme} -kmerLength 64 -minKmerL 0 -mnQS 20 -mxKmerNum 100000000 -c 1 -endPlugin -runfork1
+#step2: TagExportToFastqPlugin
+perl ~/TASSEL5/run_pipeline.pl -Xmx20g -fork1 -TagExportToFastqPlugin -db ~/gbsFeb/results/${name}.db -o ~/gbsFeb/results/${name}_1_fastq.txt.gz -c 1 -endPlugin -runfork1
+########################################################################################################################
+#step3: BWA Alignment. Create reference index just once
+#########################################################################################################################
+#~/bin/bwa index -a bwtsw ~/gbs/reference/reference.fa
+#Alignment filtered tags- good quality reads to reference genome
+~/bin/bwa aln -t 8 /local_data/GBS/rice.fa ~/gbsFeb/results/${name}_1_fastq.txt.gz  > ~/gbsFeb/results/${name}.sai
+#convert to sam format
+~/bin/bwa samse /local_data/GBS/rice.fa ~/gbsFeb/results/${name}.sai ~/gbsFeb/results/${name}_1_fastq.txt.gz  > ~/gbsFeb/results/${name}.sam
+#Step 4: SAMTogbsdbPlugin
+perl ~/TASSEL5/run_pipeline.pl -Xmx20g -fork1 -SAMToGBSdbPlugin  -i ~/gbsFeb/results/${name}.sam  -db ~/gbsFeb/results/${name}.db -aProp 0.0 -aLen 0 -endPlugin -runfork1
+#Step 5: DiscoverySNPCallerPluginV2
+perl ~/TASSEL5/run_pipeline.pl -Xmx27g -fork1 -DiscoverySNPCallerPluginV2  -db ~/gbsFeb/results/${name}.db -mnLCov 0.0 -mnMAF 0.01 -endPlugin -runfork1
+
+############################################################################################################################
+#Step 6: SNPQualityProfilerPlugin Just incase you need to confirm qualities
+###########################################################################################################################
+#perl ~/TASSEL5/run_pipeline.pl -Xmx20g -fork1 -SNPQualityProfilerPlugin -db ~/gbsFeb/results/${name}.db -statFile ~/gbsFeb/results/${name}.txt -endPlugin -runfork1 
+
+############################################################################################################################
+#Step 7:ProductionSNPCallerPluginV2
+#############################################################################################################################
+perl ~/TASSEL5/run_pipeline.pl -Xmx27g -fork1 -ProductionSNPCallerPluginV2 -db ~/gbsFeb/results/${name}.db -e ${enzyme} -i ~/gbsFeb/raw/${name} -k ${keyFile} -kmerLength 64 -mnQS 20 -o ~/gbsFeb/results/${name}.h5 -endPlugin -runfork1
+perl ~/TASSEL5/run_pipeline.pl -Xmx20G -h5 ~/gbsFeb/results/${name}.h5 -export ~/gbsFeb/results/${name}.hmp.txt -exportType Hapmap
+perl ~/TASSEL5/run_pipeline.pl -Xmx27g -fork1 -ProductionSNPCallerPluginV2 -db ~/gbsFeb/results/${name}.db -e ${enzyme} -i ~/gbsFeb/raw/${name} -k ${keyFile} -kmerLength 64 -mnQS 20 -o ~/gbsFeb/results/${name}.vcf -endPlugin -runfork1
+
+#############################################################################################################################
+#Main pipeline finished, now further SNPs cleaning based on parental polymorphism, change names accordingly..T65, WRC39 etc
+##############################################################################################################################
+
+awk ' NR==1 { for (i=1; i<=NF; i++) { f[$i] = i}}{ print $(f["rs#"]),$(f["T65"]), $(f["WRC02"]) }' ~/gbsFeb/results/${name}.hmp.txt > ~/gbsFeb/results/${name}.parents.txt
+awk '($2 != $3) && ($2 ~ /[ATGC]/ && $3 ~ /[ATGC]/){print $1}' OFS='\t' ~/gbsFeb/results/${name}.parents.txt > ~/gbsFeb/results/${name}.parents.polymorphicSites.hmp.txt
+fgrep -f ~/gbsFeb/results/${name}.parents.polymorphicSites.hmp.txt ~/gbsFeb/results/${name}.hmp.txt > ~/gbsFeb/results/${name}.FilteredReadyToImpute.hmp.txt
+
