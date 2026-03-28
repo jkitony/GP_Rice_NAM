@@ -1,302 +1,565 @@
-mamba create -n rice_gwas_env -c conda-forge --strict-channel-priority -y \
-  r-base=4.3 \
-  r-essentials \
-  r-dplyr \
-  r-ggplot2 \
-  r-foreach \
-  r-dosnow \
-  r-snow \
-  r-iterators \
-  r-codetools \
-  r-qtl \
-  r-qqman \
-  r-glmnet \
-  bioconductor-biobase
+(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS/marker_density_GWAS$
+bcftools query -f '%CHROM\t%POS\t%ID\n' Fourteen_projected.vcf > projected_markers.tsv
 
-mamba activate rice_gwas_env
-mamba install -c conda-forge r-vcfr -y
+bgzip -c Fourteen_projected.vcf > Fourteen_projected.vcf.gz
+tabix -p vcf Fourteen_projected.vcf.gz
 
-R
-install.packages(c("rrBLUP"), repos = "https://cloud.r-project.org/")
-install.packages("BiocManager", repos = "https://cloud.r-project.org/")
-BiocManager::install(c("pcaMethods"), ask = FALSE, update = FALSE)
+bcftools view -R subset_5000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_5k.vcf.gz
+bcftools view -R subset_10000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_10k.vcf.gz
+bcftools view -R subset_20000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_20k.vcf.gz
+bcftools view -R subset_40000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_40k.vcf.gz
+
+##########################################################################################################
 
 
-
-library(snow)
-library(doSNOW)
-library(parallel)
-library(qtl)
-library(dplyr)
-library(ggplot2)
-library(vcfR)
-library(pcaMethods)
-library(rrBLUP)
-library(qqman)
-library(glmnet)
-
-
-Rscript rice_gwas_clean.R
-###########################################################
-###########################################################
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#!/usr/bin/env Rscript
+#windows
+rm(list = ls())
 
 # =========================================================
-# Rice GWAS pipeline
-# Clean version for Fourteen_projected.vcf + semitrimmed_pheno.txt
+# Multi-panel GWAS pipeline for projected marker subsets
+# Runs:
+#   - Fourteen_projected_5k.vcf
+#   - Fourteen_projected_10k.vcf
+#   - Fourteen_projected_20k.vcf
+#   - Fourteen_projected_40k.vcf
+#
+# Traits to run initially:
+#   - DTH
+#   - CL
+#
+# Features:
+# - trait-by-trait omission of missing phenotypes
+# - SNP diagnostics
+# - FDR line in BLUE
+# - Bonferroni line in RED
+# - one output folder per marker panel
+# - fixed foreach export for custom functions and scalar settings
 # =========================================================
 
-suppressPackageStartupMessages({
-  library(snow)
-  library(doSNOW)
-  library(parallel)
-  library(qtl)
-  library(dplyr)
-  library(ggplot2)
-  library(vcfR)
-  library(rrBLUP)
-  library(qqman)
-  library(glmnet)
-})
+# -----------------------------
+# 1. Load required packages
+# -----------------------------
+required_pkgs <- c("vcfR", "rrBLUP", "qqman", "dplyr", "foreach", "doParallel", "parallel")
 
-# =========================================================
-# User settings
-# =========================================================
-vcf_file      <- "Fourteen_projected.vcf"
-pheno_file    <- "semitrimmed_pheno.txt"
-target_year   <- 18
-trait_cols    <- 4:14          # columns in pheno after removing first column
-n_pc          <- 4
-maf_threshold <- 0.05
-fdr_threshold <- 0.05
-n_cores       <- 24
-outdir        <- "GWAS_Year18_results"
-
-dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
-
-# =========================================================
-# Parallel backend
-# =========================================================
-cat("Detected cores:", detectCores(), "\n")
-cl <- makeCluster(n_cores, type = "SOCK")
-registerDoSNOW(cl)
-
-# Ensure cluster is stopped on exit
-on.exit({
-  try(stopCluster(cl), silent = TRUE)
-}, add = TRUE)
-
-# =========================================================
-# 1. Read VCF
-# =========================================================
-cat("Reading VCF...\n")
-vcf <- read.vcfR(vcf_file)
-
-cat("Extracting genotype matrix...\n")
-gt    <- extract.gt(vcf)
-chrom <- getCHROM(vcf)
-pos   <- getPOS(vcf)
-
-# =========================================================
-# 2. Convert genotype calls to numeric matrix
-#    0/0 = -1, 0/1 or 1/0 = 0, 1/1 = 1
-# =========================================================
-cat("Converting genotypes to numeric scores...\n")
-gt.score <- matrix(NA_real_, nrow = nrow(gt), ncol = ncol(gt))
-
-gt.score[gt %in% c("0/0", "0|0")] <- -1
-gt.score[gt %in% c("0/1", "1/0", "0|1", "1|0")] <- 0
-gt.score[gt %in% c("1/1", "1|1")] <- 1
-
-rownames(gt.score) <- rownames(gt)   # markers
-colnames(gt.score) <- colnames(gt)   # samples
-
-# transpose: rows = samples, cols = markers
-gt.score <- t(gt.score)
-
-cat("Genotype matrix dimensions (samples x markers): ", dim(gt.score)[1], " x ", dim(gt.score)[2], "\n", sep = "")
-
-# =========================================================
-# 3. Read phenotype data
-# =========================================================
-cat("Reading phenotype data...\n")
-Pheno_data <- read.table(pheno_file, header = TRUE, stringsAsFactors = FALSE)
-
-Year_data <- subset(Pheno_data, Year == target_year)
-
-if (nrow(Year_data) == 0) {
-  stop("No phenotype records found for Year == ", target_year)
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Package not installed: ", pkg)
+  }
+  library(pkg, character.only = TRUE)
 }
 
-# first column assumed to be genotype/line ID
-pheno <- Year_data[, -1, drop = FALSE]
-rownames(pheno) <- Year_data[, 1]
-
-Y <- pheno[, trait_cols, drop = FALSE]
-
-# Impute missing trait values with trait mean
-for (j in seq_len(ncol(Y))) {
-  Y[is.na(Y[, j]), j] <- mean(Y[, j], na.rm = TRUE)
-}
-
-cat("Phenotype matrix dimensions (lines x traits): ", dim(Y)[1], " x ", dim(Y)[2], "\n", sep = "")
-
-# =========================================================
-# 4. Match genotype and phenotype samples
-# =========================================================
-common_ids <- intersect(rownames(gt.score), rownames(Y))
-
-if (length(common_ids) == 0) {
-  stop("No overlapping sample IDs between genotype and phenotype data.")
-}
-
-cat("Number of matched lines:", length(common_ids), "\n")
-
-gt.score.wp <- gt.score[common_ids, , drop = FALSE]
-Y           <- Y[common_ids, , drop = FALSE]
-
-# =========================================================
-# 5. Prepare genotype dataframe for rrBLUP::GWAS
-#    rows = markers
-#    cols = marker, chrom, pos, then one column per sample
-# =========================================================
-cat("Preparing genotype table for rrBLUP GWAS...\n")
-g <- data.frame(
-  marker = colnames(gt.score.wp),
-  chrom  = as.numeric(chrom),
-  pos    = as.numeric(pos),
-  t(gt.score.wp),
-  check.names = FALSE
+# -----------------------------
+# 2. User settings
+# -----------------------------
+vcf_files <- c(
+  "Fourteen_projected_5k.vcf",
+  "Fourteen_projected_10k.vcf",
+  "Fourteen_projected_20k.vcf",
+  "Fourteen_projected_40k.vcf"
 )
 
-# sanity check
-if (nrow(g) != ncol(gt.score.wp)) {
-  stop("Mismatch between number of markers in g and gt.score.wp")
-}
+pheno_file <- "semitrimmed_pheno.txt"
 
-# =========================================================
-# 6. Kinship matrix
-# =========================================================
-cat("Calculating additive relationship matrix...\n")
-amat <- A.mat(gt.score.wp, shrink = TRUE)
-colnames(amat) <- rownames(amat) <- rownames(gt.score.wp)
+target_year <- 18
+trait_cols  <- 4:14
+#traits_to_run <- c("DTH", "CL")
 
-# =========================================================
-# 7. Trait-by-trait GWAS
-# =========================================================
-trait_names <- colnames(Y)
+n_pc        <- 4
+maf_thresh  <- 0.05
+fdr_thresh  <- 0.05
+bonf_alpha  <- 0.05
 
-for (traitName in trait_names) {
-  cat("\nRunning GWAS for:", traitName, "\n")
+ylim_max <- 12
+annotate_top_n <- 0
+min_lines_per_trait <- 30
 
-  # phenotype for current trait
-  p <- data.frame(
-    gid = rownames(Y),
-    y   = Y[, traitName],
+# DTH and CL only, so 2 cores is enough
+n_cores <- 2
+
+show_fdr_line        <- TRUE
+show_bonferroni_line <- TRUE
+show_suggestive_line <- FALSE
+suggestive_p         <- 1e-5
+
+#base_outdir <- "marker_density_GWAS"
+
+# -----------------------------
+# 3. Create base output folder
+# -----------------------------
+dir.create(base_outdir, showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------
+# 4. Helper functions
+# -----------------------------
+make_mht_table <- function(gwa_res) {
+  gwa_res$y[gwa_res$y == 0] <- NA
+  
+  mht <- data.frame(
+    SNP = gwa_res$marker,
+    CHR = as.numeric(gwa_res$chrom),
+    BP  = as.numeric(gwa_res$pos),
+    P   = 10^(-gwa_res$y),
     stringsAsFactors = FALSE
   )
-
-  # run GWAS
-  gwa <- GWAS(
-    pheno   = p,
-    geno    = g,
-    K       = amat,
-    n.PC    = n_pc,
-    min.MAF = maf_threshold,
-    plot    = FALSE
-  )
-
-  # replace 0 with NA in -log10(P)
-  gwa$y[gwa$y == 0] <- NA
-
-  # build Manhattan input
-  mht <- data.frame(
-    SNP = gwa$marker,
-    CHR = gwa$chrom,
-    BP  = gwa$pos,
-    P   = 10^(-gwa$y)
-  )
-
+  
   mht <- na.omit(mht)
-
-  # FDR
-  fdr <- p.adjust(mht$P, method = "BH")
-  sig <- mht[fdr < fdr_threshold, , drop = FALSE]
-  sig$FDR <- fdr[fdr < fdr_threshold]
-
-  # save full results
-  gwa_out <- gwa
-  gwa_out$P <- 10^(-gwa_out$y)
-  write.table(
-    gwa_out,
-    file = file.path(outdir, paste0(traitName, "_GWAS_full.tsv")),
-    sep = "\t",
-    quote = FALSE,
-    row.names = FALSE
-  )
-
-  # save Manhattan table
-  write.table(
-    mht,
-    file = file.path(outdir, paste0(traitName, "_Manhattan_input.tsv")),
-    sep = "\t",
-    quote = FALSE,
-    row.names = FALSE
-  )
-
-  # save significant hits
-  write.table(
-    sig,
-    file = file.path(outdir, paste0("QTLs_", traitName, ".tsv")),
-    sep = "\t",
-    quote = FALSE,
-    row.names = FALSE
-  )
-
-  # Manhattan plot
-  png(
-    filename = file.path(outdir, paste0(traitName, "_manhattan.png")),
-    width = 3000, height = 2400, res = 300
-  )
-  manhattan(
-    mht,
-    highlight = if (nrow(sig) > 0) sig$SNP else NULL,
-    ylim = c(0, 12),
-    cex.axis = 1.2,
-    cex.lab = 1.5,
-    font.lab = 2,
-    font.axis = 2,
-    genomewideline = FALSE,
-    suggestiveline = TRUE,
-    ylab = "-Log10(P-value)",
-    main = traitName
-  )
-  dev.off()
-
-  # QQ plot
-  png(
-    filename = file.path(outdir, paste0(traitName, "_QQ.png")),
-    width = 1800, height = 1800, res = 300
-  )
-  qq(
-    mht$P,
-    main = traitName,
-    cex.axis = 1.2,
-    cex.lab = 1.5,
-    font.lab = 2,
-    font.axis = 2,
-    ylab = "Observed -Log10(P)",
-    xlab = "Expected -Log10(P)"
-  )
-  dev.off()
-
-  cat("Finished:", traitName, "\n")
-  cat("Significant markers at FDR <", fdr_threshold, ":", nrow(sig), "\n")
+  mht <- mht[is.finite(mht$P) & mht$P > 0, , drop = FALSE]
+  mht
 }
 
-cat("\nAll traits completed.\n")
+compute_thresholds <- function(mht, fdr_thresh = 0.05, bonf_alpha = 0.05) {
+  n_markers <- nrow(mht)
+  
+  bonf_p <- bonf_alpha / n_markers
+  bonf_line <- -log10(bonf_p)
+  
+  fdr_cutoff_p <- NA
+  fdr_line <- NA
+  
+  if ("FDR" %in% colnames(mht) && any(mht$FDR < fdr_thresh, na.rm = TRUE)) {
+    fdr_cutoff_p <- max(mht$P[mht$FDR < fdr_thresh], na.rm = TRUE)
+    fdr_line <- -log10(fdr_cutoff_p)
+  }
+  
+  list(
+    n_markers = n_markers,
+    bonf_p = bonf_p,
+    bonf_line = bonf_line,
+    fdr_cutoff_p = fdr_cutoff_p,
+    fdr_line = fdr_line
+  )
+}
 
-###########################################################
-###########################################################
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+plot_manhattan_custom <- function(
+    mht,
+    sig_snps,
+    trait_name,
+    out_png,
+    out_pdf,
+    ylim_max = 12,
+    annotate_top_n = 0,
+    show_fdr_line = TRUE,
+    show_bonferroni_line = TRUE,
+    show_suggestive_line = FALSE,
+    fdr_thresh = 0.05,
+    bonf_alpha = 0.05,
+    suggestive_p = 1e-5
+) {
+  thresholds <- compute_thresholds(
+    mht = mht,
+    fdr_thresh = fdr_thresh,
+    bonf_alpha = bonf_alpha
+  )
+  
+  top_hits <- mht[order(mht$P), , drop = FALSE]
+  if (annotate_top_n > 0 && nrow(top_hits) > annotate_top_n) {
+    top_hits <- top_hits[1:annotate_top_n, , drop = FALSE]
+  }
+  
+  draw_plot <- function() {
+    manhattan(
+      mht,
+      highlight = sig_snps,
+      genomewideline = FALSE,
+      suggestiveline = FALSE,
+      ylim = c(0, ylim_max),
+      cex = 0.85,
+      cex.axis = 1.1,
+      cex.lab = 1.3,
+      font.axis = 2,
+      font.lab = 2,
+      ylab = expression(-log[10](P)),
+      main = trait_name
+    )
+    
+    if (annotate_top_n > 0 && nrow(top_hits) > 0) {
+      with(top_hits, text(x = BP, y = -log10(P), labels = SNP, cex = 0.55, pos = 3))
+    }
+    
+    if (show_fdr_line && !is.na(thresholds$fdr_line)) {
+      abline(h = thresholds$fdr_line, col = "blue", lwd = 1.8, lty = 1)
+    }
+    
+    if (show_bonferroni_line) {
+      abline(h = thresholds$bonf_line, col = "red", lwd = 1.8, lty = 2)
+    }
+    
+    if (show_suggestive_line) {
+      abline(h = -log10(suggestive_p), col = "darkgray", lwd = 1.5, lty = 3)
+    }
+  }
+  
+  png(out_png, width = 10, height = 8, units = "in", res = 300)
+  draw_plot()
+  dev.off()
+  
+  pdf(out_pdf, width = 10, height = 8)
+  draw_plot()
+  dev.off()
+}
+
+plot_qq_custom <- function(pvals, trait_name, out_png, out_pdf) {
+  png(out_png, width = 5, height = 5, units = "in", res = 300)
+  qq(
+    pvals,
+    main = trait_name,
+    cex = 0.7,
+    cex.axis = 1.1,
+    cex.lab = 1.2,
+    font.axis = 2,
+    font.lab = 2,
+    xlab = expression(Expected~~-log[10](P)),
+    ylab = expression(Observed~~-log[10](P))
+  )
+  dev.off()
+  
+  pdf(out_pdf, width = 5, height = 5)
+  qq(
+    pvals,
+    main = trait_name,
+    cex = 0.7,
+    cex.axis = 1.1,
+    cex.lab = 1.2,
+    font.axis = 2,
+    font.lab = 2,
+    xlab = expression(Expected~~-log[10](P)),
+    ylab = expression(Observed~~-log[10](P))
+  )
+  dev.off()
+}
+
+run_trait_gwas <- function(
+    trait_name,
+    Y_common,
+    M_common,
+    chrom,
+    pos,
+    n_pc,
+    maf_thresh,
+    fdr_thresh,
+    bonf_alpha,
+    ylim_max,
+    annotate_top_n,
+    min_lines_per_trait,
+    show_fdr_line,
+    show_bonferroni_line,
+    show_suggestive_line,
+    suggestive_p,
+    outdir,
+    panel_name
+) {
+  keep_lines <- rownames(Y_common)[!is.na(Y_common[, trait_name])]
+  
+  if (length(keep_lines) < min_lines_per_trait) {
+    warning("Too few lines with phenotype data for trait: ", trait_name)
+    return(NULL)
+  }
+  
+  y_trait <- Y_common[keep_lines, trait_name, drop = FALSE]
+  M_trait <- M_common[keep_lines, , drop = FALSE]
+  
+  n_lines_used <- nrow(M_trait)
+  n_markers_input <- ncol(M_trait)
+  prop_missing_genotypes <- mean(is.na(M_trait))
+  
+  marker_nonmissing <- colSums(!is.na(M_trait))
+  n_markers_all_missing <- sum(marker_nonmissing == 0)
+  
+  dosage <- M_trait + 1
+  p_alt <- colMeans(dosage, na.rm = TRUE) / 2
+  maf <- pmin(p_alt, 1 - p_alt)
+  
+  n_markers_maf_na <- sum(is.na(maf))
+  n_markers_below_maf <- sum(maf < maf_thresh, na.rm = TRUE)
+  n_markers_at_or_above_maf <- sum(maf >= maf_thresh, na.rm = TRUE)
+  
+  amat_trait <- A.mat(M_trait, shrink = TRUE)
+  colnames(amat_trait) <- rownames(amat_trait) <- rownames(M_trait)
+  
+  g_trait <- data.frame(
+    marker = colnames(M_trait),
+    chrom  = as.numeric(chrom),
+    pos    = as.numeric(pos),
+    t(M_trait),
+    check.names = FALSE
+  )
+  
+  p <- data.frame(
+    gid = rownames(y_trait),
+    y   = y_trait[, 1],
+    stringsAsFactors = FALSE
+  )
+  
+  gwa <- GWAS(
+    pheno   = p,
+    geno    = g_trait,
+    K       = amat_trait,
+    n.PC    = n_pc,
+    min.MAF = maf_thresh,
+    plot    = FALSE
+  )
+  
+  n_gwa_rows_raw <- nrow(gwa)
+  n_zero_logp <- sum(gwa$y == 0, na.rm = TRUE)
+  n_na_logp_before <- sum(is.na(gwa$y))
+  
+  mht <- make_mht_table(gwa)
+  
+  if (nrow(mht) == 0) {
+    warning("No valid GWAS results for trait: ", trait_name)
+    return(NULL)
+  }
+  
+  mht$FDR <- p.adjust(mht$P, method = "BH")
+  sig <- mht[mht$FDR < fdr_thresh, , drop = FALSE]
+  
+  thresholds <- compute_thresholds(
+    mht = mht,
+    fdr_thresh = fdr_thresh,
+    bonf_alpha = bonf_alpha
+  )
+  
+  n_markers_tested_final <- nrow(mht)
+  n_markers_removed_after_gwas <- n_markers_input - n_markers_tested_final
+  
+  diagnostics_df <- data.frame(
+    Panel = panel_name,
+    Trait = trait_name,
+    N_lines_used = n_lines_used,
+    N_markers_input = n_markers_input,
+    Prop_missing_genotypes = prop_missing_genotypes,
+    N_markers_all_missing = n_markers_all_missing,
+    N_markers_MAF_NA = n_markers_maf_na,
+    N_markers_below_MAF = n_markers_below_maf,
+    N_markers_at_or_above_MAF = n_markers_at_or_above_maf,
+    N_gwa_rows_raw = n_gwa_rows_raw,
+    N_zero_logp = n_zero_logp,
+    N_na_logp_before = n_na_logp_before,
+    N_markers_tested_final = n_markers_tested_final,
+    N_markers_removed_after_GWAS = n_markers_removed_after_gwas,
+    N_significant_FDR = nrow(sig),
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(
+    diagnostics_df,
+    file = file.path(outdir, "diagnostics", paste0(trait_name, "_diagnostics.csv")),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    mht,
+    file = file.path(outdir, "qtls", paste0(trait_name, "_all_GWAS_results.csv")),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    sig,
+    file = file.path(outdir, "qtls", paste0("QTLs_", trait_name, ".csv")),
+    row.names = FALSE
+  )
+  
+  plot_manhattan_custom(
+    mht = mht,
+    sig_snps = sig$SNP,
+    trait_name = paste0(trait_name, " (", panel_name, "; n=", n_markers_tested_final, ")"),
+    out_png = file.path(outdir, "plots", "manhattan_png", paste0(trait_name, "_manhattan.png")),
+    out_pdf = file.path(outdir, "plots", "manhattan_pdf", paste0(trait_name, "_manhattan.pdf")),
+    ylim_max = ylim_max,
+    annotate_top_n = annotate_top_n,
+    show_fdr_line = show_fdr_line,
+    show_bonferroni_line = show_bonferroni_line,
+    show_suggestive_line = show_suggestive_line,
+    fdr_thresh = fdr_thresh,
+    bonf_alpha = bonf_alpha,
+    suggestive_p = suggestive_p
+  )
+  
+  plot_qq_custom(
+    pvals = mht$P,
+    trait_name = paste0(trait_name, " (", panel_name, ")"),
+    out_png = file.path(outdir, "plots", "qq_png", paste0(trait_name, "_QQ.png")),
+    out_pdf = file.path(outdir, "plots", "qq_pdf", paste0(trait_name, "_QQ.pdf"))
+  )
+  
+  top_hit <- mht[which.min(mht$P), , drop = FALSE]
+  
+  summary_df <- data.frame(
+    Panel = panel_name,
+    Trait = trait_name,
+    N_lines_used = n_lines_used,
+    N_markers_input = n_markers_input,
+    N_markers_tested = thresholds$n_markers,
+    N_significant_FDR = nrow(sig),
+    Top_SNP = top_hit$SNP,
+    Top_CHR = top_hit$CHR,
+    Top_BP  = top_hit$BP,
+    Top_P   = top_hit$P,
+    Top_FDR = top_hit$FDR,
+    FDR_cutoff_P = thresholds$fdr_cutoff_p,
+    FDR_cutoff_log10 = thresholds$fdr_line,
+    Bonferroni_P = thresholds$bonf_p,
+    Bonferroni_log10 = thresholds$bonf_line,
+    stringsAsFactors = FALSE
+  )
+  
+  list(summary = summary_df, diagnostics = diagnostics_df)
+}
+
+run_one_panel <- function(vcf_file, pheno_file, panel_name) {
+  cat("\n====================================\n")
+  cat("Running panel:", panel_name, "\n")
+  cat("VCF:", vcf_file, "\n")
+  cat("====================================\n")
+  
+  outdir <- file.path(base_outdir, panel_name)
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "qtls"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "plots"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "plots", "manhattan_png"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "plots", "manhattan_pdf"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "plots", "qq_png"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "plots", "qq_pdf"), showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(outdir, "diagnostics"), showWarnings = FALSE, recursive = TRUE)
+  
+  cat("Reading VCF...\n")
+  vcf <- read.vcfR(vcf_file)
+  
+  gt    <- extract.gt(vcf)
+  chrom <- getCHROM(vcf)
+  pos   <- getPOS(vcf)
+  
+  cat("Raw markers in VCF:", ncol(gt), "\n")
+  cat("Raw lines in VCF:", nrow(t(gt)), "\n")
+  
+  gt_score <- matrix(NA_real_, nrow = nrow(gt), ncol = ncol(gt))
+  gt_score[gt %in% c("0/0", "0|0")] <- -1
+  gt_score[gt %in% c("0/1", "1/0", "0|1", "1|0")] <- 0
+  gt_score[gt %in% c("1/1", "1|1")] <- 1
+  
+  rownames(gt_score) <- rownames(gt)
+  colnames(gt_score) <- colnames(gt)
+  gt_score <- t(gt_score)
+  
+  recognized_calls <- sum(gt %in% c("0/0", "0|0", "0/1", "1/0", "0|1", "1|0", "1/1", "1|1"), na.rm = TRUE)
+  total_calls <- length(gt)
+  cat("Recognized genotype calls:", recognized_calls, "of", total_calls, "\n")
+  cat("Fraction recognized:", recognized_calls / total_calls, "\n")
+  
+  cat("Reading phenotype data...\n")
+  pheno_data <- read.table(pheno_file, header = TRUE, stringsAsFactors = FALSE)
+  year_data <- subset(pheno_data, Year == target_year)
+  
+  pheno <- year_data[, -1, drop = FALSE]
+  rownames(pheno) <- year_data[, 1]
+  
+  Y <- pheno[, trait_cols, drop = FALSE]
+  rownames(Y) <- rownames(pheno)
+  
+  common_lines <- intersect(rownames(Y), rownames(gt_score))
+  
+  if (length(common_lines) == 0) {
+    stop("No matching line IDs found between phenotype and genotype data for panel: ", panel_name)
+  }
+  
+  Y_common <- Y[common_lines, , drop = FALSE]
+  M_common <- gt_score[common_lines, , drop = FALSE]
+  
+  cat("Matched lines:", length(common_lines), "\n")
+  cat("Genotype matrix:", nrow(M_common), "lines x", ncol(M_common), "markers\n")
+  
+  cl <- makeCluster(n_cores)
+  doParallel::registerDoParallel(cl)
+  
+  summary_results_list <- foreach(
+    trait_name = traits_to_run,
+    .packages = c("rrBLUP", "qqman", "dplyr"),
+    .export = c(
+      "run_trait_gwas",
+      "make_mht_table",
+      "compute_thresholds",
+      "plot_manhattan_custom",
+      "plot_qq_custom",
+      "n_pc",
+      "maf_thresh",
+      "fdr_thresh",
+      "bonf_alpha",
+      "ylim_max",
+      "annotate_top_n",
+      "min_lines_per_trait",
+      "show_fdr_line",
+      "show_bonferroni_line",
+      "show_suggestive_line",
+      "suggestive_p"
+    )
+  ) %dopar% {
+    run_trait_gwas(
+      trait_name = trait_name,
+      Y_common = Y_common,
+      M_common = M_common,
+      chrom = chrom,
+      pos = pos,
+      n_pc = n_pc,
+      maf_thresh = maf_thresh,
+      fdr_thresh = fdr_thresh,
+      bonf_alpha = bonf_alpha,
+      ylim_max = ylim_max,
+      annotate_top_n = annotate_top_n,
+      min_lines_per_trait = min_lines_per_trait,
+      show_fdr_line = show_fdr_line,
+      show_bonferroni_line = show_bonferroni_line,
+      show_suggestive_line = show_suggestive_line,
+      suggestive_p = suggestive_p,
+      outdir = outdir,
+      panel_name = panel_name
+    )
+  }
+  
+  stopCluster(cl)
+  
+  valid_results <- summary_results_list[!sapply(summary_results_list, is.null)]
+  
+  if (length(valid_results) > 0) {
+    summary_table <- bind_rows(lapply(valid_results, function(x) x$summary))
+    diagnostics_table <- bind_rows(lapply(valid_results, function(x) x$diagnostics))
+    
+    write.csv(summary_table, file.path(outdir, "GWAS_summary.csv"), row.names = FALSE)
+    write.csv(diagnostics_table, file.path(outdir, "diagnostics", "all_traits_diagnostics.csv"), row.names = FALSE)
+    
+    summary_table
+  } else {
+    NULL
+  }
+}
+
+# -----------------------------
+# 5. Run all panels
+# -----------------------------
+all_panel_summaries <- list()
+
+for (vcf_file in vcf_files) {
+  panel_name <- sub("\\.vcf(?:\\.gz)?$", "", basename(vcf_file))
+  panel_summary <- run_one_panel(vcf_file, pheno_file, panel_name)
+  
+  if (!is.null(panel_summary)) {
+    all_panel_summaries[[panel_name]] <- panel_summary
+  }
+}
+
+# -----------------------------
+# 6. Save combined summary
+# -----------------------------
+if (length(all_panel_summaries) > 0) {
+  combined_summary <- bind_rows(all_panel_summaries)
+  write.csv(
+    combined_summary,
+    file = file.path(base_outdir, "combined_marker_density_summary.csv"),
+    row.names = FALSE
+  )
+  cat("\nSaved combined summary to:\n")
+  cat(file.path(base_outdir, "combined_marker_density_summary.csv"), "\n")
+} else {
+  cat("No panel produced GWAS output.\n")
+}
+
+cat("Done.\n")
