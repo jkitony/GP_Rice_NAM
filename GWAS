@@ -1,13 +1,14 @@
 (base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS/marker_density_GWAS$
-bcftools query -f '%CHROM\t%POS\t%ID\n' Fourteen_projected.vcf > projected_markers.tsv
+bcftools query -f '%CHROM\t%POS\t%ID\n' Fourteen_56k.vcf > projected_56k_markers.tsv
 
-bgzip -c Fourteen_projected.vcf > Fourteen_projected.vcf.gz
-tabix -p vcf Fourteen_projected.vcf.gz
+bgzip -c Fourteen_56k.vcf > Fourteen_56k.vcf.gz
+tabix -p vcf Fourteen_56k.vcf.gz
 
-bcftools view -R subset_5000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_5k.vcf.gz
-bcftools view -R subset_10000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_10k.vcf.gz
-bcftools view -R subset_20000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_20k.vcf.gz
-bcftools view -R subset_40000.regions Fourteen_projected.vcf.gz -Oz -o Fourteen_projected_40k.vcf.gz
+#python below first
+bcftools view -R subset_5000.regions Fourteen_56k.vcf.gz -Oz -o Fourteen_projected_5k.vcf.gz
+bcftools view -R subset_10000.regions Fourteen_56k.vcf.gz -Oz -o Fourteen_projected_10k.vcf.gz
+bcftools view -R subset_20000.regions Fourteen_56k.vcf.gz -Oz -o Fourteen_projected_20k.vcf.gz
+bcftools view -R subset_40000.regions Fourteen_56k.vcf.gz -Oz -o Fourteen_projected_40k.vcf.gz
 #########################################################################################################
 #!/usr/bin/env python3
 
@@ -17,7 +18,7 @@ import numpy as np
 # -----------------------------
 # Settings
 # -----------------------------
-input_file = "projected_markers.tsv"
+input_file = "projected_56k_markers.tsv"
 target_sizes = [5000, 10000, 20000, 40000]
 seed = 42
 
@@ -96,22 +97,22 @@ for target in target_sizes:
     print(f"  Final markers written: {len(sampled)}")
 ############
 ###########
-Total markers: 78154
+Total markers: 56042
 
 Markers per chromosome:
 CHROM
-1     13293
-2     10049
-3     17143
-4       590
-5      5453
-6      5601
-7      4003
-8      2787
-9      3697
-10     6743
-11     3191
-12     5604
+1     6057
+2     5938
+3     6239
+4     4701
+5     5100
+6     4493
+7     4288
+8     4076
+9     3363
+10    3641
+11    4272
+12    3874
 Name: count, dtype: int64
 
 Creating subset: 5000
@@ -130,7 +131,7 @@ Creating subset: 40000
 ##########################################################################################################
 #GWAS running
 
-#windows
+#windows R
 rm(list = ls())
 
 # =========================================================
@@ -141,9 +142,10 @@ rm(list = ls())
 #   - Fourteen_projected_20k.vcf
 #   - Fourteen_projected_40k.vcf
 #
-# Traits to run initially:
-#   - DTH
-#   - CL
+#(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS$ gunzip Fourteen_projected_5k.vcf.gz
+#(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS$ gunzip Fourteen_projected_10k.vcf.gz
+#(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS$ gunzip Fourteen_projected_20k.vcf.gz
+#(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS$ gunzip Fourteen_projected_40k.vcf.gz
 #
 # Features:
 # - trait-by-trait omission of missing phenotypes
@@ -681,3 +683,242 @@ if (length(all_panel_summaries) > 0) {
 }
 
 cat("Done.\n")
+########################################################################
+# =========================================================
+# Re-plot ONLY: overwrite Manhattan + QQ plots
+# No GWAS rerun
+# Manhattan = 2.5 x 1.5
+# QQ        = 2.2 x 2.2
+# =========================================================
+
+library(qqman)
+
+base_outdir <- "results_gwas_56k_staggered"
+
+traits_to_run <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+
+panel_names <- c(
+  "Fourteen_projected_5k",
+  "Fourteen_projected_10k",
+  "Fourteen_projected_20k",
+  "Fourteen_projected_40k"
+)
+
+# figure sizes
+manh_width  <- 2.5
+manh_height <- 1.5
+qq_width    <- 2.2
+qq_height   <- 2.2
+
+png_res <- 600
+
+# thresholds
+show_fdr_line        <- TRUE
+show_bonferroni_line <- TRUE
+show_suggestive_line <- FALSE
+fdr_thresh           <- 0.05
+bonf_alpha           <- 0.05
+suggestive_p         <- 1e-5
+
+ylim_max <- 12
+
+compute_thresholds <- function(mht, fdr_thresh = 0.05, bonf_alpha = 0.05) {
+  n_markers <- nrow(mht)
+  
+  bonf_p <- bonf_alpha / n_markers
+  bonf_line <- -log10(bonf_p)
+  
+  fdr_cutoff_p <- NA
+  fdr_line <- NA
+  
+  if ("FDR" %in% colnames(mht) && any(mht$FDR < fdr_thresh, na.rm = TRUE)) {
+    fdr_cutoff_p <- max(mht$P[mht$FDR < fdr_thresh], na.rm = TRUE)
+    fdr_line <- -log10(fdr_cutoff_p)
+  }
+  
+  list(
+    n_markers = n_markers,
+    bonf_p = bonf_p,
+    bonf_line = bonf_line,
+    fdr_cutoff_p = fdr_cutoff_p,
+    fdr_line = fdr_line
+  )
+}
+
+plot_manhattan_compact <- function(
+    mht,
+    trait_name,
+    out_png,
+    out_pdf,
+    ylim_max = 12,
+    show_fdr_line = TRUE,
+    show_bonferroni_line = TRUE,
+    show_suggestive_line = FALSE,
+    fdr_thresh = 0.05,
+    bonf_alpha = 0.05,
+    suggestive_p = 1e-5,
+    width = 2.5,
+    height = 1.5,
+    res = 600
+) {
+  thresholds <- compute_thresholds(mht, fdr_thresh, bonf_alpha)
+  
+  draw_plot <- function() {
+    par(
+      mar = c(2.6, 2.8, 1.2, 0.4),
+      mgp = c(1.45, 0.42, 0),
+      tcl = -0.22,
+      font.lab = 2,
+      font.axis = 2,
+      font.main = 2
+    )
+    
+    manhattan(
+      mht,
+      genomewideline = FALSE,
+      suggestiveline = FALSE,
+      ylim = c(0, ylim_max),
+      cex = 0.38,
+      cex.axis = 0.72,
+      cex.lab = 0.82,
+      ylab = expression(-log[10](P)),
+      main = NULL
+    )
+    
+    title(main = trait_name, cex.main = 0.82, line = 0.15, font.main = 2)
+    
+    if (show_fdr_line && !is.na(thresholds$fdr_line)) {
+      abline(h = thresholds$fdr_line, col = "blue", lwd = 1)
+    }
+    
+    if (show_bonferroni_line) {
+      abline(h = thresholds$bonf_line, col = "red", lwd = 1, lty = 2)
+    }
+    
+    if (show_suggestive_line) {
+      abline(h = -log10(suggestive_p), col = "darkgray", lwd = 0.8, lty = 3)
+    }
+  }
+  
+  png(out_png, width = width, height = height, units = "in", res = res)
+  draw_plot()
+  dev.off()
+  
+  pdf(out_pdf, width = width, height = height, useDingbats = FALSE)
+  draw_plot()
+  dev.off()
+}
+
+plot_qq_compact <- function(
+    pvals,
+    trait_name,
+    out_png,
+    out_pdf,
+    width = 2.2,
+    height = 2.2,
+    res = 600
+) {
+  pvals <- pvals[is.finite(pvals) & !is.na(pvals) & pvals > 0]
+  
+  draw_plot <- function() {
+    par(
+      mar = c(2.8, 2.8, 1.2, 0.4),
+      mgp = c(1.55, 0.45, 0),
+      tcl = -0.22,
+      font.lab = 2,
+      font.axis = 2,
+      font.main = 2
+    )
+    
+    qq(
+      pvals,
+      main = NULL,
+      cex = 0.45,
+      cex.axis = 0.8,
+      cex.lab = 0.85,
+      xlab = expression(Expected~~-log[10](P)),
+      ylab = expression(Observed~~-log[10](P))
+    )
+    
+    title(main = trait_name, cex.main = 0.85, line = 0.15, font.main = 2)
+  }
+  
+  png(out_png, width = width, height = height, units = "in", res = res)
+  draw_plot()
+  dev.off()
+  
+  pdf(out_pdf, width = width, height = height, useDingbats = FALSE)
+  draw_plot()
+  dev.off()
+}
+
+# ---------------------------------------------------------
+# Rebuild all plots from saved GWAS result CSV files
+# ---------------------------------------------------------
+for (panel_name in panel_names) {
+  
+  cat("\nRe-plotting:", panel_name, "\n")
+  
+  outdir <- file.path(base_outdir, panel_name)
+  
+  for (trait_name in traits_to_run) {
+    
+    gwas_file <- file.path(outdir, "qtls", paste0(trait_name, "_all_GWAS_results.csv"))
+    
+    if (!file.exists(gwas_file)) {
+      cat("Skipping missing file:", gwas_file, "\n")
+      next
+    }
+    
+    mht <- read.csv(gwas_file, stringsAsFactors = FALSE)
+    
+    needed_cols <- c("SNP", "CHR", "BP", "P")
+    if (!all(needed_cols %in% colnames(mht))) {
+      cat("Skipping malformed file:", gwas_file, "\n")
+      next
+    }
+    
+    if (!"FDR" %in% colnames(mht)) {
+      mht$FDR <- p.adjust(mht$P, method = "BH")
+    }
+    
+    mht <- mht[is.finite(mht$P) & !is.na(mht$P) & mht$P > 0, , drop = FALSE]
+    
+    if (nrow(mht) == 0) {
+      cat("No valid rows in:", gwas_file, "\n")
+      next
+    }
+    
+    plot_manhattan_compact(
+      mht = mht,
+      trait_name = trait_name,
+      out_png = file.path(outdir, "plots", "manhattan_png", paste0(trait_name, "_manhattan.png")),
+      out_pdf = file.path(outdir, "plots", "manhattan_pdf", paste0(trait_name, "_manhattan.pdf")),
+      ylim_max = ylim_max,
+      show_fdr_line = show_fdr_line,
+      show_bonferroni_line = show_bonferroni_line,
+      show_suggestive_line = show_suggestive_line,
+      fdr_thresh = fdr_thresh,
+      bonf_alpha = bonf_alpha,
+      suggestive_p = suggestive_p,
+      width = manh_width,
+      height = manh_height,
+      res = png_res
+    )
+    
+    plot_qq_compact(
+      pvals = mht$P,
+      trait_name = trait_name,
+      out_png = file.path(outdir, "plots", "qq_png", paste0(trait_name, "_QQ.png")),
+      out_pdf = file.path(outdir, "plots", "qq_pdf", paste0(trait_name, "_QQ.pdf")),
+      width = qq_width,
+      height = qq_height,
+      res = png_res
+    )
+    
+    cat("Saved:", panel_name, trait_name, "\n")
+  }
+}
+
+cat("\nDone. All plots overwritten as high-resolution PDF and PNG.\n")
+
