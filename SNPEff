@@ -1,0 +1,90 @@
+cd /mnt/c/Rice/2026/GWAS/snpEff_latest_core/snpEff
+
+java -Xmx16g -jar snpEff.jar ann \
+  Oryza_sativa \
+  /mnt/c/Rice/2026/GWAS/WNAM_merged.vcf \
+  > /mnt/c/Rice/2026/GWAS/WNAM_merged.ann.vcf
+
+########
+#!/usr/bin/env bash
+set -euo pipefail
+
+QTL_DIR="/mnt/c/Rice/2026/GWAS/results_gwas_2kGBS/qtls"
+ANN_VCF="/mnt/c/Rice/2026/GWAS/WNAM_merged.ann.vcf"
+SNPSIFT_JAR="/mnt/c/Rice/2026/GWAS/snpEff_latest_core/snpEff/SnpSift.jar"
+
+for TRAIT in DTH CL; do
+  QTL_CSV="${QTL_DIR}/QTLs_${TRAIT}.csv"
+
+  ID_LIST="${QTL_DIR}/${TRAIT}_ids.txt"
+  HITS_VCF="${QTL_DIR}/${TRAIT}_hits_from_WNAM_merged.ann.vcf"
+  RAW_ANN="${QTL_DIR}/${TRAIT}_hits_from_WNAM_merged.rawANN.tsv"
+  PARSED_TSV="${QTL_DIR}/${TRAIT}_hits_from_WNAM_merged.tsv"
+  FUNCTIONAL_TSV="${QTL_DIR}/${TRAIT}_hits_from_WNAM_merged.functional.tsv"
+
+  echo "========================================"
+  echo "Processing trait: ${TRAIT}"
+  echo "========================================"
+
+  awk -F',' 'NR>1 {
+    gsub(/"/, "", $1)
+    gsub(/\r/, "", $1)
+    print $1
+  }' "${QTL_CSV}" | LC_ALL=C sort -u > "${ID_LIST}"
+
+  java -jar "${SNPSIFT_JAR}" filter \
+    --set "${ID_LIST}" \
+    "ID in SET[0]" \
+    "${ANN_VCF}" \
+    > "${HITS_VCF}"
+
+  java -jar "${SNPSIFT_JAR}" extractFields \
+    "${HITS_VCF}" \
+    CHROM POS ID REF ALT ANN \
+    > "${RAW_ANN}"
+
+  awk 'BEGIN{
+    FS=OFS="\t";
+    print "CHROM","POS","ID","REF","ALT","ALLELE","ANNOTATION","IMPACT","GENE_NAME","GENE_ID","FEATURE_TYPE","FEATURE_ID","BIOTYPE","RANK","HGVS_C","HGVS_P"
+  }
+  $1=="CHROM" {next}
+  {
+    split($6, ann_records, ",")
+    for(i in ann_records){
+      n=split(ann_records[i], a, /\|/)
+      print $1,$2,$3,$4,$5,
+            a[1],a[2],a[3],a[4],a[5],a[6],a[7],a[8],a[9],a[10],a[11]
+    }
+  }' "${RAW_ANN}" > "${PARSED_TSV}"
+
+  awk 'BEGIN{FS=OFS="\t"}
+  NR==1 || $7 ~ /missense_variant|stop_gained|start_lost|stop_lost|splice_acceptor_variant|splice_donor_variant|synonymous_variant/' \
+  "${PARSED_TSV}" > "${FUNCTIONAL_TSV}"
+
+  echo "IDs: $(wc -l < "${ID_LIST}")"
+  echo "Matched variants: $(grep -vc '^#' "${HITS_VCF}")"
+  echo "All annotations: $(($(wc -l < "${PARSED_TSV}") - 1))"
+  echo "Functional rows: $(($(wc -l < "${FUNCTIONAL_TSV}") - 1))"
+  echo
+done
+
+echo "All done."
+
+
+
+######################################################################
+######################################################################
+(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS/snpEff_latest_core/snpEff$
+
+bcftools view -v snps -m2 -M2 \
+  /mnt/c/Rice/2026/GWAS/Fourteen_56k.vcf \
+  -o /mnt/c/Rice/2026/GWAS/Fourteen_56k.snps.vcf
+
+java -Xmx16g -jar snpEff.jar ann \
+  Oryza_sativa \
+  /mnt/c/Rice/2026/GWAS/Fourteen_projected_5k.snps.vcf \
+  > /mnt/c/Rice/2026/GWAS/Fourteen_projected_5k.snps.ann.vcf
+
+
+#dos2unix extract_all_qtl_candidates.sh
+
