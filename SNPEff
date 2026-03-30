@@ -1,3 +1,128 @@
+
+#################################################################################
+#################################################################################
+#From 56k SNPEff 40k more resolutions
+#################################################################################
+#################################################################################
+(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS/snpEff_latest_core/snpEff$
+
+bcftools view -v snps -m2 -M2 \
+  /mnt/c/Rice/2026/GWAS/Fourteen_projected_40k.vcf \
+  -o /mnt/c/Rice/2026/GWAS/Fourteen_projected_40k.snps.vcf
+
+java -Xmx16g -jar snpEff.jar ann \
+  Oryza_sativa \
+  /mnt/c/Rice/2026/GWAS/Fourteen_projected_40k.snps.vcf \
+  > /mnt/c/Rice/2026/GWAS/Fourteen_projected_40k.snps.ann.vcf
+############################################################################
+(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS$ ./extract_all_qtl_candidates.sh
+############################################################################
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==========================================
+# Paths
+# ==========================================
+BASE="/mnt/c/Rice/2026/GWAS"
+PANEL="Fourteen_projected_40k"
+QTL_DIR="${BASE}/results_gwas_56k_staggered/${PANEL}/qtls"
+
+ANN_VCF="${BASE}/${PANEL}.snps.ann.vcf"
+
+SNPEFF_DIR="/mnt/c/Rice/2026/GWAS/snpEff_latest_core/snpEff"
+SNPSIFT_JAR="${SNPEFF_DIR}/SnpSift.jar"
+
+# ==========================================
+# Check input
+# ==========================================
+if [[ ! -f "${ANN_VCF}" ]]; then
+  echo "ERROR: Annotated VCF not found: ${ANN_VCF}"
+  exit 1
+fi
+
+if [[ ! -d "${QTL_DIR}" ]]; then
+  echo "ERROR: QTL directory not found: ${QTL_DIR}"
+  exit 1
+fi
+
+# ==========================================
+# Loop over all QTL files
+# ==========================================
+for QTL_CSV in "${QTL_DIR}"/QTLs_*.csv; do
+  [[ -e "${QTL_CSV}" ]] || { echo "No QTLs_*.csv files found in ${QTL_DIR}"; exit 1; }
+
+  BASENAME=$(basename "${QTL_CSV}" .csv)   # e.g. QTLs_DTH
+  TRAIT=${BASENAME#QTLs_}                   # e.g. DTH
+
+  echo "=========================================="
+  echo "Processing trait: ${TRAIT}"
+  echo "Input QTL file: ${QTL_CSV}"
+  echo "=========================================="
+
+  ID_LIST="${QTL_DIR}/${TRAIT}_ids.txt"
+  HITS_VCF="${QTL_DIR}/${TRAIT}_hits.ann.vcf"
+  BRIEF_TSV="${QTL_DIR}/${TRAIT}_candidate_genes.tsv"
+  FUNCTIONAL_TSV="${QTL_DIR}/${TRAIT}_candidate_genes_functional.tsv"
+
+  # ------------------------------------------
+  # 1. Extract SNP IDs from GWAS CSV
+  # ------------------------------------------
+  awk -F',' 'NR>1 {gsub(/"/,"",$1); print $1}' "${QTL_CSV}" > "${ID_LIST}"
+
+  echo "Saved SNP IDs: ${ID_LIST}"
+
+  # ------------------------------------------
+  # 2. Filter annotated VCF for these GWAS hits
+  # ------------------------------------------
+  java -jar "${SNPSIFT_JAR}" filter \
+    --set "${ID_LIST}" \
+    "ID in SET[0]" \
+    "${ANN_VCF}" \
+    > "${HITS_VCF}"
+
+  echo "Saved hit VCF: ${HITS_VCF}"
+
+  # ------------------------------------------
+  # 3. Extract annotation fields
+  # ------------------------------------------
+  java -jar "${SNPSIFT_JAR}" extractFields \
+    "${HITS_VCF}" \
+    CHROM POS ID REF ALT \
+    "ANN[*].ALLELE" \
+    "ANN[*].GENE" \
+    "ANN[*].GENEID" \
+    "ANN[*].FEATURE" \
+    "ANN[*].BIOTYPE" \
+    "ANN[*].EFFECT" \
+    "ANN[*].IMPACT" \
+    "ANN[*].HGVS_C" \
+    "ANN[*].HGVS_P" \
+    > "${BRIEF_TSV}"
+
+  echo "Saved candidate table: ${BRIEF_TSV}"
+
+  # ------------------------------------------
+  # 4. Keep only more functional effects
+  # ------------------------------------------
+  awk 'BEGIN{FS=OFS="\t"}
+  NR==1 || $0 ~ /missense_variant|stop_gained|start_lost|stop_lost|splice_acceptor_variant|splice_donor_variant/' \
+  "${BRIEF_TSV}" > "${FUNCTIONAL_TSV}"
+
+  echo "Saved functional candidate table: ${FUNCTIONAL_TSV}"
+  echo
+done
+
+echo "All traits completed."
+
+
+
+
+#################################################################################
+#################################################################################
+#Merged
+#################################################################################
+#################################################################################
+#dos2unix extract_all_qtl_candidates.sh
 cd /mnt/c/Rice/2026/GWAS/snpEff_latest_core/snpEff
 
 java -Xmx16g -jar snpEff.jar ann \
@@ -71,20 +196,4 @@ done
 echo "All done."
 
 
-
-######################################################################
-######################################################################
-(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS/snpEff_latest_core/snpEff$
-
-bcftools view -v snps -m2 -M2 \
-  /mnt/c/Rice/2026/GWAS/Fourteen_56k.vcf \
-  -o /mnt/c/Rice/2026/GWAS/Fourteen_56k.snps.vcf
-
-java -Xmx16g -jar snpEff.jar ann \
-  Oryza_sativa \
-  /mnt/c/Rice/2026/GWAS/Fourteen_projected_5k.snps.vcf \
-  > /mnt/c/Rice/2026/GWAS/Fourteen_projected_5k.snps.ann.vcf
-
-
-#dos2unix extract_all_qtl_candidates.sh
 
