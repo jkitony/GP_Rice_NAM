@@ -1,0 +1,350 @@
+rm(list = ls())
+
+#############################
+# Libraries
+#############################
+library(snow)
+library(doSNOW)
+library(parallel)
+library(rrBLUP)
+library(BGLR)
+library(dplyr)
+library(corpcor)
+library(vcfR)
+library(pcaMethods)
+library(qqman)
+library(glmnet)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+
+#############################
+# Parallel setup
+#############################
+n_cores <- 8
+cl <- makeCluster(n_cores, type = "SOCK")
+registerDoSNOW(cl)
+
+#############################
+# Load phenotype data
+#############################
+Pheno_data  <- read.table("semitrimmed_pheno.txt", header = TRUE)
+Year18_data <- subset(Pheno_data, Year == 18)
+
+#############################
+# Read VCF and prepare markers
+#############################
+vcf <- read.vcfR("Fourteen_projected_5k.vcf")
+
+gt <- extract.gt(vcf)
+chrom <- getCHROM(vcf)
+pos   <- getPOS(vcf)
+
+gt.score <- matrix(NA, nrow(gt), ncol(gt))
+gt.score[gt == "0/0"] <- -1
+gt.score[gt == "0/1"] <- 0
+gt.score[gt == "1/1"] <- 1
+
+rownames(gt.score) <- rownames(gt)
+colnames(gt.score) <- colnames(gt)
+gt.score <- t(gt.score)
+
+# Impute missing marker data only
+impute <- A.mat(
+  gt.score,
+  max.missing   = 0.5,
+  impute.method = "mean",
+  return.imputed = TRUE
+)
+
+SNP_Markers_imputed <- impute$imputed
+
+GD <- as.data.frame(SNP_Markers_imputed)
+GD <- dplyr::as_tibble(GD, rownames = "Genotype")
+
+#############################
+# Merge phenotype + genotype
+#############################
+pheno_year_data <- Year18_data
+year <- "2018"
+
+data_pg <- merge(pheno_year_data, GD, by = "Genotype")
+
+# Marker matrix
+X_all <- data_pg[, 16:ncol(data_pg)]
+
+# Trait matrix
+Y_all <- data_pg[, 5:15]
+
+trait_order <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+trait_order <- trait_order[trait_order %in% colnames(Y_all)]
+
+#############################
+# Helper function:
+# run one trait at a time, dropping NA phenotypes
+#############################
+run_cv_trait <- function(trait_name, data_pg, marker_start_col = 16,
+                         folds = 5, replications = 1,
+                         model = c("rrBLUP", "RKHS", "BayesB", "BL"),
+                         nIter = 50, burnIn = 15, h = 0.5) {
+  
+  model <- match.arg(model)
+  
+  # Keep only non-missing phenotype for this trait
+  subdat <- data_pg[!is.na(data_pg[[trait_name]]), , drop = FALSE]
+  
+  if (nrow(subdat) < folds + 2) {
+    warning(paste("Skipping trait", trait_name, "for model", model, "- too few non-missing observations"))
+    return(NULL)
+  }
+  
+  y <- subdat[[trait_name]]
+  X <- as.matrix(subdat[, marker_start_col:ncol(subdat)])
+  n <- nrow(X)
+  p <- ncol(X)
+  
+  # model-specific kernel/precomputation
+  if (model == "rrBLUP") {
+    K <- A.mat(X, impute.method = "EM", n.core = 4, max.missing = 0.5, shrink = TRUE)
+  }
+  
+  if (model == "RKHS") {
+    D <- (as.matrix(dist(X, method = "euclidean"))^2) / p
+    U <- exp(-h * D)
+  }
+  
+  all_fold_acc <- c()
+  rep_means <- c()
+  
+  set.seed(723641600)
+  
+  for (r in seq_len(replications)) {
+    tst_assign <- sample(rep(1:folds, length.out = n))
+    fold_acc <- rep(NA_real_, folds)
+    
+    for (i in seq_len(folds)) {
+      yNA <- y
+      test_idx <- which(tst_assign == i)
+      train_idx <- setdiff(seq_len(n), test_idx)
+      
+      yNA[test_idx] <- NA
+      
+      if (model == "rrBLUP") {
+        fit <- mixed.solve(y = yNA, K = K)
+        yhat <- fit$u[test_idx]
+      }
+      
+      if (model == "RKHS") {
+        ETA <- list(list(K = U, model = "RKHS"))
+        fit <- BGLR(y = yNA, ETA = ETA, nIter = nIter, burnIn = burnIn, verbose = FALSE)
+        yhat <- fit$yHat[test_idx]
+      }
+      
+      if (model == "BayesB") {
+        ETA <- list(list(X = X, model = "BayesB"))
+        fit <- BGLR(y = yNA, ETA = ETA, nIter = nIter, burnIn = burnIn, verbose = FALSE)
+        yhat <- fit$yHat[test_idx]
+      }
+      
+      if (model == "BL") {
+        ETA <- list(list(X = X, model = "BL"))
+        fit <- BGLR(y = yNA, ETA = ETA, nIter = nIter, burnIn = burnIn, verbose = FALSE)
+        yhat <- fit$yHat[test_idx]
+      }
+      
+      obs <- y[test_idx]
+      
+      if (length(test_idx) > 1 && sd(obs, na.rm = TRUE) > 0 && sd(yhat, na.rm = TRUE) > 0) {
+        fold_acc[i] <- cor(yhat, obs, use = "complete.obs")
+      } else {
+        fold_acc[i] <- NA
+      }
+    }
+    
+    all_fold_acc <- c(all_fold_acc, fold_acc)
+    rep_means <- c(rep_means, mean(fold_acc, na.rm = TRUE))
+  }
+  
+  list(
+    summary = data.frame(
+      Trait = trait_name,
+      Model = model,
+      N_used = n,
+      Mean_Accuracy = mean(rep_means, na.rm = TRUE),
+      SE_Accuracy = sd(all_fold_acc, na.rm = TRUE) / sqrt(sum(!is.na(all_fold_acc)))
+    ),
+    folds = data.frame(
+      Trait = trait_name,
+      Model = model,
+      Accuracy = all_fold_acc
+    )
+  )
+}
+
+#############################
+# Run all models
+#############################
+results_summary <- list()
+results_folds <- list()
+
+# rrBLUP
+for (tr in trait_order) {
+  out <- run_cv_trait(
+    trait_name = tr,
+    data_pg = data_pg,
+    marker_start_col = 16,
+    folds = 5,
+    replications = 2,
+    model = "rrBLUP"
+  )
+  if (!is.null(out)) {
+    results_summary[[paste0("rrBLUP_", tr)]] <- out$summary
+    results_folds[[paste0("rrBLUP_", tr)]] <- out$folds
+  }
+}
+
+# RKHS
+for (tr in trait_order) {
+  out <- run_cv_trait(
+    trait_name = tr,
+    data_pg = data_pg,
+    marker_start_col = 16,
+    folds = 5,
+    replications = 1,
+    model = "RKHS",
+    nIter = 50,
+    burnIn = 15,
+    h = 0.5
+  )
+  if (!is.null(out)) {
+    results_summary[[paste0("RKHS_", tr)]] <- out$summary
+    results_folds[[paste0("RKHS_", tr)]] <- out$folds
+  }
+}
+
+# BayesB
+for (tr in trait_order) {
+  out <- run_cv_trait(
+    trait_name = tr,
+    data_pg = data_pg,
+    marker_start_col = 16,
+    folds = 5,
+    replications = 1,
+    model = "BayesB",
+    nIter = 50,
+    burnIn = 15
+  )
+  if (!is.null(out)) {
+    results_summary[[paste0("BayesB_", tr)]] <- out$summary
+    results_folds[[paste0("BayesB_", tr)]] <- out$folds
+  }
+}
+
+# BL
+for (tr in trait_order) {
+  out <- run_cv_trait(
+    trait_name = tr,
+    data_pg = data_pg,
+    marker_start_col = 16,
+    folds = 5,
+    replications = 1,
+    model = "BL",
+    nIter = 50,
+    burnIn = 15
+  )
+  if (!is.null(out)) {
+    results_summary[[paste0("BL_", tr)]] <- out$summary
+    results_folds[[paste0("BL_", tr)]] <- out$folds
+  }
+}
+
+accuracy_summary <- bind_rows(results_summary)
+accuracy_long    <- bind_rows(results_folds)
+
+# Keep model order clean
+accuracy_summary$Model <- factor(accuracy_summary$Model, levels = c("rrBLUP", "RKHS", "BayesB", "BL"))
+accuracy_long$Model    <- factor(accuracy_long$Model,    levels = c("rrBLUP", "RKHS", "BayesB", "BL"))
+
+accuracy_summary$Trait <- factor(accuracy_summary$Trait, levels = trait_order)
+accuracy_long$Trait    <- factor(accuracy_long$Trait,    levels = trait_order)
+
+#############################
+# Save tables
+#############################
+write.csv(accuracy_summary, "prediction_accuracy_summary_2018.csv", row.names = FALSE)
+write.csv(accuracy_long,    "prediction_accuracy_folds_2018.csv",   row.names = FALSE)
+
+#############################
+# Plot
+#############################
+library(grid)
+
+p <- ggplot(accuracy_summary, aes(x = Trait, y = Mean_Accuracy, fill = Model)) +
+  geom_bar(
+    stat = "identity",
+    position = position_dodge(width = 0.70),
+    width = 0.80
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = Mean_Accuracy - SE_Accuracy,
+      ymax = Mean_Accuracy + SE_Accuracy
+    ),
+    position = position_dodge(width = 0.70),
+    width = 0.15,
+    linewidth = 0.30
+  ) +
+  theme_classic() +
+  labs(
+    title = "",
+    x = "Trait",
+    y = "Prediction Accuracy",
+    fill = "Model"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 7, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 7, color = "black"),
+    axis.text.x  = element_text(face = "plain", size = 6, angle = 45, hjust = 1, color = "black"),
+    axis.text.y  = element_text(face = "plain", size = 6, color = "black"),
+    
+    legend.position = "right",
+    legend.justification = "center",
+    legend.title = element_text(face = "bold", size = 5, color = "black"),
+    legend.text  = element_text(face = "bold", size = 5, color = "black"),
+    legend.key.size = unit(0.28, "cm"),
+    legend.spacing.y = unit(0.02, "cm"),
+    legend.box.spacing = unit(0.03, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    
+    plot.margin = margin(2, 1, 2, 2),
+    axis.line = element_line(linewidth = 0.4, color = "black")
+  ) +
+  guides(
+    fill = guide_legend(
+      title = "Model",
+      ncol = 1,
+      byrow = TRUE
+    )
+  )
+
+ggsave(
+  filename = "prediction_accuracy_barplot_2018.pdf",
+  plot = p,
+  width = 2.5,
+  height = 1.5,
+  units = "in"
+)
+
+ggsave(
+  filename = "prediction_accuracy_barplot_2018.png",
+  plot = p,
+  width = 2.5,
+  height = 1.5,
+  units = "in",
+  dpi = 600
+)
+
+#############################
+# Stop cluster
+#############################
+stopCluster(cl)
