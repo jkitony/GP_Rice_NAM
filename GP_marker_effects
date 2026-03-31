@@ -1,0 +1,538 @@
+rm(list = ls())
+rm(list = ls())
+
+#############################
+# Libraries
+#############################
+library(snow)
+library(doSNOW)
+library(parallel)
+library(rrBLUP)
+library(BGLR)
+library(dplyr)
+library(vcfR)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(tibble)
+
+#############################
+# Parallel setup
+#############################
+n_cores <- 8
+cl <- makeCluster(n_cores, type = "SOCK")
+registerDoSNOW(cl)
+
+#############################
+# Input files
+#############################
+pheno_file <- "semitrimmed_pheno.txt"
+
+vcf_files <- c(
+  Fourteen_projected_5k  = "Fourteen_projected_5k.vcf",
+  Fourteen_projected_10k = "Fourteen_projected_10k.vcf",
+  Fourteen_projected_20k = "Fourteen_projected_20k.vcf",
+  Fourteen_projected_40k = "Fourteen_projected_40k.vcf"
+)
+
+#############################
+# Output directory
+#############################
+outdir <- "marker_density_results_2018"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+#############################
+# Load phenotype data
+#############################
+Pheno_data  <- read.table(pheno_file, header = TRUE)
+Year18_data <- subset(Pheno_data, Year == 18)
+
+#############################
+# Trait order
+#############################
+trait_order <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+
+#############################
+# Models
+#############################
+model_order <- c("rrBLUP", "RKHS", "BayesB", "BL")
+
+#############################
+# Helper: marker density from panel name
+#############################
+get_marker_density <- function(panel_name) {
+  as.numeric(sub(".*_(\\d+)k$", "\\1", panel_name)) * 1000
+}
+
+#############################
+# Helper: read and encode VCF
+#############################
+prepare_marker_data <- function(vcf_file) {
+  vcf <- read.vcfR(vcf_file, verbose = FALSE)
+  
+  gt <- extract.gt(vcf)
+  
+  gt.score <- matrix(NA, nrow(gt), ncol(gt))
+  gt.score[gt == "0/0"] <- -1
+  gt.score[gt == "0/1"] <- 0
+  gt.score[gt == "1/1"] <- 1
+  
+  rownames(gt.score) <- rownames(gt)
+  colnames(gt.score) <- colnames(gt)
+  
+  gt.score <- t(gt.score)
+  
+  # Impute only marker missingness
+  impute <- A.mat(
+    gt.score,
+    max.missing = 0.5,
+    impute.method = "mean",
+    return.imputed = TRUE
+  )
+  
+  GD <- as.data.frame(impute$imputed)
+  GD <- rownames_to_column(GD, var = "Genotype")
+  return(GD)
+}
+
+#############################
+# Helper: create fixed folds per trait
+# Same phenotype folds are used within each panel
+#############################
+make_trait_folds <- function(data_pg, traits, folds = 5, seed = 723641600) {
+  set.seed(seed)
+  fold_list <- list()
+  
+  for (tr in traits) {
+    idx <- which(!is.na(data_pg[[tr]]))
+    n <- length(idx)
+    
+    if (n < folds + 2) next
+    
+    fold_assign <- sample(rep(1:folds, length.out = n))
+    
+    fold_list[[tr]] <- list(
+      valid_rows = idx,
+      fold_assign = fold_assign
+    )
+  }
+  
+  return(fold_list)
+}
+
+#############################
+# Helper: run CV for one trait and one model
+#############################
+run_cv_trait <- function(data_pg, trait_name, fold_info,
+                         marker_start_col,
+                         model = c("rrBLUP", "RKHS", "BayesB", "BL"),
+                         replications = 1,
+                         nIter = 50, burnIn = 15, h = 0.5) {
+  
+  model <- match.arg(model)
+  
+  if (is.null(fold_info[[trait_name]])) return(NULL)
+  
+  keep_idx   <- fold_info[[trait_name]]$valid_rows
+  tst_assign <- fold_info[[trait_name]]$fold_assign
+  
+  subdat <- data_pg[keep_idx, , drop = FALSE]
+  
+  y <- subdat[[trait_name]]
+  X <- as.matrix(subdat[, marker_start_col:ncol(subdat)])
+  
+  n <- nrow(X)
+  p <- ncol(X)
+  folds <- length(unique(tst_assign))
+  
+  # Precompute model matrices
+  if (model == "rrBLUP") {
+    K <- A.mat(X, impute.method = "EM", n.core = 4, max.missing = 0.5, shrink = TRUE)
+  }
+  
+  if (model == "RKHS") {
+    D <- (as.matrix(dist(X, method = "euclidean"))^2) / p
+    U <- exp(-h * D)
+  }
+  
+  all_fold_acc <- c()
+  rep_means <- c()
+  
+  for (r in seq_len(replications)) {
+    fold_acc <- rep(NA_real_, folds)
+    
+    for (i in seq_len(folds)) {
+      test_idx <- which(tst_assign == i)
+      
+      yNA <- y
+      yNA[test_idx] <- NA
+      
+      if (model == "rrBLUP") {
+        fit <- mixed.solve(y = yNA, K = K)
+        yhat <- fit$u[test_idx]
+      }
+      
+      if (model == "RKHS") {
+        ETA <- list(list(K = U, model = "RKHS"))
+        fit <- BGLR(y = yNA, ETA = ETA, nIter = nIter, burnIn = burnIn, verbose = FALSE)
+        yhat <- fit$yHat[test_idx]
+      }
+      
+      if (model == "BayesB") {
+        ETA <- list(list(X = X, model = "BayesB"))
+        fit <- BGLR(y = yNA, ETA = ETA, nIter = nIter, burnIn = burnIn, verbose = FALSE)
+        yhat <- fit$yHat[test_idx]
+      }
+      
+      if (model == "BL") {
+        ETA <- list(list(X = X, model = "BL"))
+        fit <- BGLR(y = yNA, ETA = ETA, nIter = nIter, burnIn = burnIn, verbose = FALSE)
+        yhat <- fit$yHat[test_idx]
+      }
+      
+      obs <- y[test_idx]
+      
+      if (length(test_idx) > 1 && sd(obs, na.rm = TRUE) > 0 && sd(yhat, na.rm = TRUE) > 0) {
+        fold_acc[i] <- cor(yhat, obs, use = "complete.obs")
+      } else {
+        fold_acc[i] <- NA
+      }
+    }
+    
+    all_fold_acc <- c(all_fold_acc, fold_acc)
+    rep_means <- c(rep_means, mean(fold_acc, na.rm = TRUE))
+  }
+  
+  return(data.frame(
+    Trait = trait_name,
+    Model = model,
+    N_used = n,
+    Mean_Accuracy = mean(rep_means, na.rm = TRUE),
+    SE_Accuracy = sd(all_fold_acc, na.rm = TRUE) / sqrt(sum(!is.na(all_fold_acc)))
+  ))
+}
+
+#############################
+# Main analysis loop
+#############################
+all_results <- list()
+
+for (panel_name in names(vcf_files)) {
+  cat("Running panel:", panel_name, "\n")
+  
+  GD <- prepare_marker_data(vcf_files[[panel_name]])
+  data_pg <- merge(Year18_data, GD, by = "Genotype")
+  
+  ycols <- trait_order[trait_order %in% colnames(data_pg)]
+  
+  # Marker columns begin after merged phenotype columns
+  marker_start_col <- which(colnames(data_pg) == colnames(GD)[2])
+  
+  # Fixed folds for this panel
+  fold_info <- make_trait_folds(data_pg, traits = ycols, folds = 5, seed = 723641600)
+  
+  panel_results <- list()
+  
+  for (tr in ycols) {
+    panel_results[[paste0(tr, "_rrBLUP")]] <- run_cv_trait(
+      data_pg = data_pg,
+      trait_name = tr,
+      fold_info = fold_info,
+      marker_start_col = marker_start_col,
+      model = "rrBLUP",
+      replications = 2
+    )
+    
+    panel_results[[paste0(tr, "_RKHS")]] <- run_cv_trait(
+      data_pg = data_pg,
+      trait_name = tr,
+      fold_info = fold_info,
+      marker_start_col = marker_start_col,
+      model = "RKHS",
+      replications = 1,
+      nIter = 50,
+      burnIn = 15,
+      h = 0.5
+    )
+    
+    panel_results[[paste0(tr, "_BayesB")]] <- run_cv_trait(
+      data_pg = data_pg,
+      trait_name = tr,
+      fold_info = fold_info,
+      marker_start_col = marker_start_col,
+      model = "BayesB",
+      replications = 1,
+      nIter = 50,
+      burnIn = 15
+    )
+    
+    panel_results[[paste0(tr, "_BL")]] <- run_cv_trait(
+      data_pg = data_pg,
+      trait_name = tr,
+      fold_info = fold_info,
+      marker_start_col = marker_start_col,
+      model = "BL",
+      replications = 1,
+      nIter = 50,
+      burnIn = 15
+    )
+  }
+  
+  panel_df <- bind_rows(panel_results)
+  panel_df$Panel <- panel_name
+  panel_df$Marker_Density <- get_marker_density(panel_name)
+  
+  all_results[[panel_name]] <- panel_df
+}
+
+results_df <- bind_rows(all_results)
+
+#############################
+# Format factors
+#############################
+results_df$Trait <- factor(results_df$Trait, levels = trait_order)
+results_df$Model <- factor(results_df$Model, levels = model_order)
+results_df$Panel <- factor(results_df$Panel, levels = names(vcf_files))
+
+#############################
+# Save main summary table
+#############################
+write.csv(
+  results_df,
+  file.path(outdir, "marker_density_prediction_accuracy_summary_2018.csv"),
+  row.names = FALSE
+)
+
+#############################
+# Overall summary across traits
+# For MAIN Figure
+#############################
+overall_df <- results_df %>%
+  group_by(Model, Marker_Density) %>%
+  summarise(
+    Mean_Accuracy = mean(Mean_Accuracy, na.rm = TRUE),
+    SE_Accuracy = sd(Mean_Accuracy, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+write.csv(
+  overall_df,
+  file.path(outdir, "marker_density_prediction_accuracy_overall_2018.csv"),
+  row.names = FALSE
+)
+
+#############################
+# Plot theme helper
+#############################
+theme_pub <- theme_classic() +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 7, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 7, color = "black"),
+    axis.text.x  = element_text(face = "plain", size = 6, color = "black"),
+    axis.text.y  = element_text(face = "plain", size = 6, color = "black"),
+    legend.title = element_text(face = "plain", size = 5, color = "black"),
+    legend.text  = element_text(face = "plain", size = 5, color = "black"),
+    legend.key.size = unit(0.28, "cm"),
+    legend.spacing.y = unit(0.02, "cm"),
+    legend.box.spacing = unit(0.03, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    plot.margin = margin(2, 2, 2, 2),
+    axis.line = element_line(linewidth = 0.4, color = "black")
+  )
+
+#############################
+# MAIN FIGURE
+# Overall marker-density trend
+# One line per model
+#############################
+p_main <- ggplot(
+  overall_df,
+  aes(x = Marker_Density, y = Mean_Accuracy, color = Model, group = Model)
+) +
+  geom_line(linewidth = 0.45) +
+  geom_point(size = 1.1) +
+  geom_errorbar(
+    aes(ymin = Mean_Accuracy - SE_Accuracy, ymax = Mean_Accuracy + SE_Accuracy),
+    width = 700,
+    linewidth = 0.25
+  ) +
+  scale_x_continuous(
+    breaks = c(5000, 10000, 20000, 40000),
+    labels = c("5k", "10k", "20k", "40k")
+  ) +
+  labs(
+    x = "Marker number",
+    y = "Mean prediction accuracy",
+    color = "Model"
+  ) +
+  theme_pub +
+  theme(
+    legend.position = "right"
+  ) +
+  guides(
+    color = guide_legend(
+      title = "Model",
+      ncol = 1,
+      byrow = TRUE
+    )
+  )
+
+ggsave(
+  filename = file.path(outdir, "Figure_main_marker_density_overall_2018.pdf"),
+  plot = p_main,
+  width = 2.5,
+  height = 1.5,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "Figure_main_marker_density_overall_2018.png"),
+  plot = p_main,
+  width = 2.5,
+  height = 1.5,
+  units = "in",
+  dpi = 600
+)
+
+#############################
+# SUPPLEMENTARY FIGURE 1
+# Trait-wise panels, one panel per trait
+# One line per model
+#############################
+p_supp1 <- ggplot(
+  results_df,
+  aes(x = Marker_Density, y = Mean_Accuracy, color = Model, group = Model)
+) +
+  geom_line(linewidth = 0.35) +
+  geom_point(size = 0.8) +
+  geom_errorbar(
+    aes(ymin = Mean_Accuracy - SE_Accuracy, ymax = Mean_Accuracy + SE_Accuracy),
+    width = 500,
+    linewidth = 0.2
+  ) +
+  facet_wrap(~Trait, ncol = 4) +
+  scale_x_continuous(
+    breaks = c(5000, 10000, 20000, 40000),
+    labels = c("5k", "10k", "20k", "40k")
+  ) +
+  labs(
+    x = "Marker number",
+    y = "Prediction accuracy",
+    color = "Model"
+  ) +
+  theme_pub +
+  theme(
+    strip.text = element_text(face = "bold", size = 10, color = "black"),
+    strip.background = element_blank(),
+    
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    #ticks
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    
+    #labs
+    axis.title.x = element_text(size = 10, face = "bold"),
+    axis.title.y = element_text(size = 10, face = "bold"),
+    
+    legend.position = c(0.90, 0.02),
+    legend.justification = c(1, 0),
+    legend.text = element_text(size = 9),
+    legend.title = element_text(size = 10, face = "bold")
+  ) +
+  guides(
+    color = guide_legend(
+      title = "Model",
+      ncol = 1,
+      byrow = TRUE,
+      override.aes = list(size = 2)
+    )
+  )
+
+ggsave(
+  filename = file.path(outdir, "Figure_S1_traitwise_marker_density_effect_2018.pdf"),
+  plot = p_supp1,
+  width = 6.5,
+  height = 4.8,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "Figure_S1_traitwise_marker_density_effect_2018.png"),
+  plot = p_supp1,
+  width = 6.5,
+  height = 4.8,
+  units = "in",
+  dpi = 600
+)
+
+#############################
+# SUPPLEMENTARY FIGURE 2
+# Heatmap: trait x marker density
+# Facet by model
+#############################
+heat_df <- results_df %>%
+  mutate(
+    Marker_Label = factor(
+      Marker_Density,
+      levels = c(5000, 10000, 20000, 40000),
+      labels = c("5k", "10k", "20k", "40k")
+    )
+  )
+
+p_supp2 <- ggplot(
+  heat_df,
+  aes(x = Marker_Label, y = Trait, fill = Mean_Accuracy)
+) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  facet_wrap(~Model, ncol = 2) +
+  labs(
+    x = "Marker number",
+    y = "Trait",
+    fill = "Accuracy"
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 8, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 8, color = "black"),
+    axis.text.x  = element_text(face = "plain", size = 7, color = "black"),
+    axis.text.y  = element_text(face = "plain", size = 7, color = "black"),
+    strip.text   = element_text(face = "bold", size = 7, color = "black"),
+    legend.title = element_text(face = "plain", size = 7, color = "black"),
+    legend.text  = element_text(face = "plain", size = 6, color = "black"),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+ggsave(
+  filename = file.path(outdir, "Figure_S2_heatmap_marker_density_accuracy_2018.pdf"),
+  plot = p_supp2,
+  width = 6.0,
+  height = 4.5,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "Figure_S2_heatmap_marker_density_accuracy_2018.png"),
+  plot = p_supp2,
+  width = 6.0,
+  height = 4.5,
+  units = "in",
+  dpi = 600
+)
+
+#############################
+# SUPPLEMENTARY TABLE
+# Wide-format table for easier viewing
+#############################
+supp_table <- results_df %>%
+  arrange(Trait, Model, Marker_Density)
+
+write.csv(
+  supp_table,
+  file.path(outdir, "Supplementary_Table_marker_density_trait_model_2018.csv"),
+  row.names = FALSE
+)
+
+#############################
+# Stop cluster
+#############################
+stopCluster(cl)
