@@ -38,8 +38,8 @@ k_folds <- 5
 n_reps  <- 10
 
 # balanced production settings
-nIter  <- 400
-burnIn <- 100
+nIter  <- 50000
+burnIn <- 10000
 
 rkhs_h <- 0.5
 global_seed <- 723641600
