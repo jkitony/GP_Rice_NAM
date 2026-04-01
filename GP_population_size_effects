@@ -1,0 +1,765 @@
+#!/usr/bin/env Rscript
+
+############################################################
+# FINAL PRODUCTION VERSION
+# 11 traits x 10 repeats
+# Resume-safe parallel population-size CV script
+# Workers compute, main process saves checkpoints
+############################################################
+
+suppressPackageStartupMessages({
+  library(vcfR)
+  library(rrBLUP)
+  library(BGLR)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(grid)
+  library(parallel)
+  library(doParallel)
+  library(foreach)
+})
+
+############################################################
+# User settings
+############################################################
+n_cores <- 4   # increase only if RAM allows
+pheno_file <- "semitrimmed_pheno.txt"
+vcf_file   <- "Fourteen_projected_10k.vcf"
+outdir     <- "population_size_effect_2018_trueCV5x10_final"
+
+trait_order <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+model_order <- c("rrBLUP", "RKHS", "BayesB", "BL")
+
+train_fracs <- c(0.20, 0.40, 0.60, 0.80, 1.00)
+
+k_folds <- 5
+n_reps  <- 10
+
+# balanced production settings
+nIter  <- 400
+burnIn <- 100
+
+rkhs_h <- 0.5
+global_seed <- 723641600
+
+############################################################
+# Output folders
+############################################################
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+checkdir <- file.path(outdir, "checkpoints")
+dir.create(checkdir, showWarnings = FALSE, recursive = TRUE)
+logdir <- file.path(outdir, "logs")
+dir.create(logdir, showWarnings = FALSE, recursive = TRUE)
+
+############################################################
+# Logging helper
+############################################################
+logfile <- file.path(logdir, "run_log.txt")
+
+log_message <- function(...) {
+  msg <- paste0(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "), paste(..., collapse = ""))
+  cat(msg, "\n")
+  cat(msg, "\n", file = logfile, append = TRUE)
+}
+
+writeLines(capture.output(sessionInfo()), file.path(outdir, "sessionInfo.txt"))
+
+############################################################
+# Helper functions
+############################################################
+task_file <- function(trait, rep_i, fold_i, frac) {
+  frac_lab <- paste0(sprintf("%03d", as.integer(frac * 100)), "pct")
+  file.path(
+    checkdir,
+    paste0(trait, "_rep", rep_i, "_fold", fold_i, "_", frac_lab, ".rds")
+  )
+}
+
+safe_save_rds <- function(object, file) {
+  dir.create(dirname(file), showWarnings = FALSE, recursive = TRUE)
+  tmp <- paste0(file, ".tmp")
+  saveRDS(object, tmp)
+  if (file.exists(file)) file.remove(file)
+  ok <- file.rename(tmp, file)
+  if (!ok) stop("Could not rename temporary file to final RDS: ", file)
+}
+
+sample_by_family_idx <- function(family_vec, candidate_idx, frac = 0.2, min_n = 1, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  fam_df <- data.frame(
+    idx = candidate_idx,
+    Family = family_vec[candidate_idx],
+    stringsAsFactors = FALSE
+  )
+  
+  split_idx <- split(fam_df$idx, fam_df$Family)
+  
+  sampled <- lapply(split_idx, function(x) {
+    n <- length(x)
+    take <- floor(n * frac)
+    if (take < min_n && n >= min_n) take <- min_n
+    if (take > n) take <- n
+    sample(x, size = take, replace = FALSE)
+  })
+  
+  out <- sort(unlist(sampled, use.names = FALSE))
+  out[!is.na(out)]
+}
+
+make_family_folds <- function(family_vec, k = 5, seed = 12345) {
+  set.seed(seed)
+  fold_id <- rep(NA_integer_, length(family_vec))
+  
+  split_idx <- split(seq_along(family_vec), family_vec)
+  
+  for (fam in names(split_idx)) {
+    idx <- split_idx[[fam]]
+    idx <- sample(idx, length(idx), replace = FALSE)
+    fam_folds <- rep(seq_len(k), length.out = length(idx))
+    fold_id[idx] <- fam_folds
+  }
+  
+  fold_id
+}
+
+prepare_marker_matrix <- function(vcf_file) {
+  log_message("Reading VCF: ", vcf_file)
+  
+  vcf <- read.vcfR(vcf_file, verbose = FALSE)
+  gt  <- extract.gt(vcf)
+  
+  gt.score <- matrix(NA_real_, nrow = nrow(gt), ncol = ncol(gt))
+  gt.score[gt == "0/0"] <- -1
+  gt.score[gt == "0|0"] <- -1
+  gt.score[gt == "0/1"] <-  0
+  gt.score[gt == "1/0"] <-  0
+  gt.score[gt == "0|1"] <-  0
+  gt.score[gt == "1|0"] <-  0
+  gt.score[gt == "1/1"] <-  1
+  gt.score[gt == "1|1"] <-  1
+  
+  rownames(gt.score) <- rownames(gt)
+  colnames(gt.score) <- colnames(gt)
+  
+  X <- t(gt.score)
+  
+  imp <- A.mat(
+    X,
+    max.missing = 0.5,
+    impute.method = "mean",
+    return.imputed = TRUE
+  )
+  
+  imp$imputed
+}
+
+make_rkhs_kernel <- function(X, h = 0.5) {
+  p <- ncol(X)
+  G <- tcrossprod(X)
+  sq <- rowSums(X^2)
+  D2 <- outer(sq, sq, "+") - 2 * G
+  D2[D2 < 0] <- 0
+  D2 <- D2 / p
+  exp(-h * D2)
+}
+
+run_one_block <- function(tr, rep_i, fold_i, frac,
+                          X_trait, y_trait, family_vec, fold_assign,
+                          G_rr, K_rkhs,
+                          model_order, nIter, burnIn, base_seed) {
+  
+  valid_idx <- which(fold_assign == fold_i)
+  pool_idx  <- which(fold_assign != fold_i)
+  
+  if (length(valid_idx) < 5 || length(pool_idx) < 20) {
+    return(NULL)
+  }
+  
+  seed_block <- base_seed + rep_i * 10000 + fold_i * 100 + as.integer(frac * 100)
+  
+  train_idx <- sample_by_family_idx(
+    family_vec = family_vec,
+    candidate_idx = pool_idx,
+    frac = frac,
+    min_n = 1,
+    seed = seed_block
+  )
+  
+  if (length(train_idx) < 20) {
+    return(NULL)
+  }
+  
+  y_valid <- y_trait[valid_idx]
+  y_train <- y_trait[train_idx]
+  
+  if (all(is.na(y_train)) || all(is.na(y_valid))) {
+    return(NULL)
+  }
+  
+  block_results <- vector("list", length(model_order))
+  
+  for (m in seq_along(model_order)) {
+    model_name <- model_order[m]
+    
+    yhat <- tryCatch({
+      
+      if (model_name == "rrBLUP") {
+        K_train <- G_rr[train_idx, train_idx, drop = FALSE]
+        K_valid_train <- G_rr[valid_idx, train_idx, drop = FALSE]
+        fit <- mixed.solve(y = y_train, K = K_train)
+        as.vector(K_valid_train %*% fit$u)
+        
+      } else if (model_name == "RKHS") {
+        idx_all <- c(train_idx, valid_idx)
+        K_sub <- K_rkhs[idx_all, idx_all, drop = FALSE]
+        y_comb <- c(y_train, rep(NA_real_, length(valid_idx)))
+        ETA <- list(list(K = K_sub, model = "RKHS"))
+        fit <- BGLR(
+          y = y_comb,
+          ETA = ETA,
+          nIter = nIter,
+          burnIn = burnIn,
+          verbose = FALSE
+        )
+        fit$yHat[(length(train_idx) + 1):(length(train_idx) + length(valid_idx))]
+        
+      } else if (model_name == "BayesB") {
+        X_comb <- rbind(
+          X_trait[train_idx, , drop = FALSE],
+          X_trait[valid_idx, , drop = FALSE]
+        )
+        y_comb <- c(y_train, rep(NA_real_, length(valid_idx)))
+        ETA <- list(list(X = X_comb, model = "BayesB"))
+        fit <- BGLR(
+          y = y_comb,
+          ETA = ETA,
+          nIter = nIter,
+          burnIn = burnIn,
+          verbose = FALSE
+        )
+        fit$yHat[(length(train_idx) + 1):(length(train_idx) + length(valid_idx))]
+        
+      } else if (model_name == "BL") {
+        X_comb <- rbind(
+          X_trait[train_idx, , drop = FALSE],
+          X_trait[valid_idx, , drop = FALSE]
+        )
+        y_comb <- c(y_train, rep(NA_real_, length(valid_idx)))
+        ETA <- list(list(X = X_comb, model = "BL"))
+        fit <- BGLR(
+          y = y_comb,
+          ETA = ETA,
+          nIter = nIter,
+          burnIn = burnIn,
+          verbose = FALSE
+        )
+        fit$yHat[(length(train_idx) + 1):(length(train_idx) + length(valid_idx))]
+      }
+      
+    }, error = function(e) {
+      data.frame(
+        Trait = tr,
+        Model = model_name,
+        Rep = rep_i,
+        Fold = fold_i,
+        Train_Fraction_of_Pool = frac,
+        Train_Fraction_Label = paste0(as.integer(frac * 100), "%"),
+        N_train = length(train_idx),
+        N_pool = length(pool_idx),
+        N_valid = length(valid_idx),
+        Accuracy = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    })
+    
+    if (is.data.frame(yhat)) {
+      block_results[[m]] <- yhat
+      next
+    }
+    
+    acc <- if (all(is.na(yhat)) ||
+               sum(!is.na(yhat)) < 3 ||
+               sd(yhat, na.rm = TRUE) == 0 ||
+               sd(y_valid, na.rm = TRUE) == 0) {
+      NA_real_
+    } else {
+      suppressWarnings(cor(yhat, y_valid, use = "complete.obs"))
+    }
+    
+    block_results[[m]] <- data.frame(
+      Trait = tr,
+      Model = model_name,
+      Rep = rep_i,
+      Fold = fold_i,
+      Train_Fraction_of_Pool = frac,
+      Train_Fraction_Label = paste0(as.integer(frac * 100), "%"),
+      N_train = length(train_idx),
+      N_pool = length(pool_idx),
+      N_valid = length(valid_idx),
+      Accuracy = acc,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  bind_rows(block_results)
+}
+
+############################################################
+# Load data
+############################################################
+log_message("Loading phenotype file")
+pheno <- read.table(pheno_file, header = TRUE, stringsAsFactors = FALSE)
+pheno18 <- subset(pheno, Year == 18)
+
+X_all <- prepare_marker_matrix(vcf_file)
+geno_df <- data.frame(Genotype = rownames(X_all), stringsAsFactors = FALSE)
+
+data_pg <- merge(pheno18, geno_df, by = "Genotype")
+data_pg <- data_pg %>% filter(!is.na(Family))
+
+log_message("Merged phenotype rows: ", nrow(data_pg))
+
+############################################################
+# Start parallel backend
+############################################################
+log_message("Starting parallel backend with ", n_cores, " cores")
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {
+  suppressPackageStartupMessages({
+    library(rrBLUP)
+    library(BGLR)
+    library(dplyr)
+  })
+  NULL
+})
+
+############################################################
+# Main analysis
+############################################################
+set.seed(global_seed)
+
+for (tr in trait_order) {
+  
+  if (!tr %in% colnames(data_pg)) {
+    log_message("Skipping missing trait: ", tr)
+    next
+  }
+  
+  df_trait <- data_pg %>% filter(!is.na(.data[[tr]]))
+  
+  if (nrow(df_trait) < 50) {
+    log_message("Skipping trait with too few lines: ", tr, " (n=", nrow(df_trait), ")")
+    next
+  }
+  
+  log_message("Preparing trait: ", tr, " (n=", nrow(df_trait), ")")
+  
+  idx_trait <- match(df_trait$Genotype, rownames(X_all))
+  X_trait <- X_all[idx_trait, , drop = FALSE]
+  rownames(X_trait) <- df_trait$Genotype
+  
+  y_trait <- df_trait[[tr]]
+  family_vec <- df_trait$Family
+  
+  log_message("Precomputing rrBLUP relationship matrix for ", tr)
+  G_rr <- A.mat(X_trait, impute.method = "mean", shrink = TRUE)
+  
+  log_message("Precomputing RKHS kernel for ", tr)
+  K_rkhs <- make_rkhs_kernel(X_trait, h = rkhs_h)
+  
+  task_grid <- expand.grid(
+    Rep = seq_len(n_reps),
+    Fold = seq_len(k_folds),
+    Frac = train_fracs,
+    stringsAsFactors = FALSE
+  )
+  
+  fold_list <- vector("list", n_reps)
+  for (rep_i in seq_len(n_reps)) {
+    fold_list[[rep_i]] <- make_family_folds(
+      family_vec = family_vec,
+      k = k_folds,
+      seed = 1000 + which(trait_order == tr) * 100 + rep_i
+    )
+  }
+  
+  task_grid$File <- mapply(
+    FUN = task_file,
+    trait = tr,
+    rep_i = task_grid$Rep,
+    fold_i = task_grid$Fold,
+    frac = task_grid$Frac
+  )
+  
+  todo <- task_grid[!file.exists(task_grid$File), , drop = FALSE]
+  done_n <- nrow(task_grid) - nrow(todo)
+  
+  log_message("Trait ", tr, ": already finished ", done_n, " / ", nrow(task_grid), " blocks")
+  
+  if (nrow(todo) == 0) {
+    log_message("Trait ", tr, " fully complete; skipping")
+    next
+  }
+  
+  clusterExport(
+    cl,
+    varlist = c(
+      "run_one_block",
+      "sample_by_family_idx",
+      "model_order",
+      "nIter",
+      "burnIn"
+    ),
+    envir = environment()
+  )
+  
+  res_list <- foreach(
+    i = seq_len(nrow(todo)),
+    .packages = c("rrBLUP", "BGLR", "dplyr"),
+    .errorhandling = "pass"
+  ) %dopar% {
+    
+    tr_i   <- tr
+    rep_i  <- todo$Rep[i]
+    fold_i <- todo$Fold[i]
+    frac_i <- todo$Frac[i]
+    file_i <- todo$File[i]
+    
+    fold_assign_i <- fold_list[[rep_i]]
+    
+    tryCatch({
+      res <- run_one_block(
+        tr = tr_i,
+        rep_i = rep_i,
+        fold_i = fold_i,
+        frac = frac_i,
+        X_trait = X_trait,
+        y_trait = y_trait,
+        family_vec = family_vec,
+        fold_assign = fold_assign_i,
+        G_rr = G_rr,
+        K_rkhs = K_rkhs,
+        model_order = model_order,
+        nIter = nIter,
+        burnIn = burnIn,
+        base_seed = global_seed + which(trait_order == tr_i) * 100000
+      )
+      
+      list(
+        ok = TRUE,
+        file = file_i,
+        result = res,
+        trait = tr_i,
+        rep = rep_i,
+        fold = fold_i,
+        frac = frac_i,
+        err = NULL
+      )
+    }, error = function(e) {
+      list(
+        ok = FALSE,
+        file = file_i,
+        result = NULL,
+        trait = tr_i,
+        rep = rep_i,
+        fold = fold_i,
+        frac = frac_i,
+        err = e$message
+      )
+    })
+  }
+  
+  saved_count  <- 0L
+  failed_count <- 0L
+  null_count   <- 0L
+  
+  for (x in res_list) {
+    if (inherits(x, "error")) {
+      failed_count <- failed_count + 1L
+      log_message("Foreach-level error for trait ", tr)
+      next
+    }
+    
+    if (!isTRUE(x$ok)) {
+      failed_count <- failed_count + 1L
+      log_message(
+        "Worker failed: Trait=", x$trait,
+        " Rep=", x$rep,
+        " Fold=", x$fold,
+        " Frac=", x$frac,
+        " Error=", x$err
+      )
+      next
+    }
+    
+    if (is.null(x$result) || nrow(x$result) == 0) {
+      null_count <- null_count + 1L
+      log_message(
+        "No result returned: Trait=", x$trait,
+        " Rep=", x$rep,
+        " Fold=", x$fold,
+        " Frac=", x$frac
+      )
+      next
+    }
+    
+    tryCatch({
+      safe_save_rds(x$result, x$file)
+      saved_count <- saved_count + 1L
+      log_message("Saved checkpoint: ", basename(x$file), " (rows=", nrow(x$result), ")")
+    }, error = function(e) {
+      failed_count <<- failed_count + 1L
+      log_message("Checkpoint save failed for ", x$file, " :: ", e$message)
+    })
+  }
+  
+  log_message(
+    "Trait ", tr,
+    " save summary: saved=", saved_count,
+    ", null=", null_count,
+    ", failed=", failed_count
+  )
+  
+  log_message("Finished trait: ", tr)
+}
+
+stopCluster(cl)
+log_message("Parallel backend stopped")
+
+############################################################
+# Combine checkpoint results
+############################################################
+log_message("Combining checkpoint files")
+rds_files <- list.files(checkdir, pattern = "\\.rds$", full.names = TRUE)
+
+if (length(rds_files) == 0) {
+  stop("No checkpoint files found in: ", checkdir)
+}
+
+results_df <- bind_rows(lapply(rds_files, readRDS))
+
+if (nrow(results_df) == 0) {
+  stop("Checkpoint files found, but combined results are empty.")
+}
+
+############################################################
+# Summary tables
+############################################################
+summary_df <- results_df %>%
+  group_by(Trait, Model, Train_Fraction_of_Pool, Train_Fraction_Label) %>%
+  summarise(
+    N_runs = sum(!is.na(Accuracy)),
+    Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+    SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+    SE_Accuracy = SD_Accuracy / sqrt(pmax(N_runs, 1)),
+    Mean_N_train = mean(N_train, na.rm = TRUE),
+    Mean_N_valid = mean(N_valid, na.rm = TRUE),
+    Mean_N_pool  = mean(N_pool, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+overall_df <- results_df %>%
+  group_by(Model, Train_Fraction_of_Pool, Train_Fraction_Label) %>%
+  summarise(
+    N_runs = sum(!is.na(Accuracy)),
+    Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+    SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+    SE_Accuracy = SD_Accuracy / sqrt(pmax(N_runs, 1)),
+    Mean_N_train = mean(N_train, na.rm = TRUE),
+    Mean_N_valid = mean(N_valid, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+############################################################
+# Save tables
+############################################################
+write.csv(
+  results_df,
+  file.path(outdir, "population_size_prediction_accuracy_raw_2018.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  summary_df,
+  file.path(outdir, "population_size_prediction_accuracy_summary_2018.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  overall_df,
+  file.path(outdir, "population_size_prediction_accuracy_overall_2018.csv"),
+  row.names = FALSE
+)
+
+############################################################
+# Plot formatting
+############################################################
+summary_df$Trait <- factor(summary_df$Trait, levels = trait_order)
+summary_df$Model <- factor(summary_df$Model, levels = model_order)
+overall_df$Model <- factor(overall_df$Model, levels = model_order)
+
+theme_pub <- theme_classic() +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 7, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 7, color = "black"),
+    axis.text.x  = element_text(face = "plain", size = 6, color = "black"),
+    axis.text.y  = element_text(face = "plain", size = 6, color = "black"),
+    legend.title = element_text(face = "plain", size = 5, color = "black"),
+    legend.text  = element_text(face = "plain", size = 5, color = "black"),
+    legend.key.size = unit(0.28, "cm"),
+    legend.spacing.y = unit(0.02, "cm"),
+    legend.box.spacing = unit(0.03, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    plot.margin = margin(2, 2, 2, 2),
+    axis.line = element_line(linewidth = 0.4, color = "black")
+  )
+
+############################################################
+# MAIN FIGURE 1
+############################################################
+p_trait <- ggplot(
+  summary_df,
+  aes(x = Train_Fraction_of_Pool, y = Mean_Accuracy, color = Model, group = Model)
+) +
+  geom_line(linewidth = 0.35) +
+  geom_point(size = 0.8) +
+  geom_errorbar(
+    aes(ymin = Mean_Accuracy - SE_Accuracy, ymax = Mean_Accuracy + SE_Accuracy),
+    width = 0.03,
+    linewidth = 0.2
+  ) +
+  facet_wrap(~Trait, ncol = 4) +
+  scale_x_continuous(
+    breaks = train_fracs,
+    labels = c("20", "40", "60", "80", "100")
+  ) +
+  labs(
+    x = "Training population size (% of current training partition)",
+    y = "Prediction accuracy",
+    color = "Model"
+  ) +
+  theme_pub +
+  theme(
+    strip.text = element_text(face = "bold", size = 6, color = "black"),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = file.path(outdir, "Figure_main_traitwise_population_size_effect_2018.pdf"),
+  plot = p_trait,
+  width = 6.5,
+  height = 4.8,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "Figure_main_traitwise_population_size_effect_2018.png"),
+  plot = p_trait,
+  width = 6.5,
+  height = 4.8,
+  units = "in",
+  dpi = 600
+)
+
+############################################################
+# MAIN FIGURE 2
+############################################################
+heat_df <- summary_df %>%
+  mutate(
+    Size_Label = factor(
+      Train_Fraction_Label,
+      levels = c("20%", "40%", "60%", "80%", "100%")
+    )
+  )
+
+p_heat <- ggplot(
+  heat_df,
+  aes(x = Size_Label, y = Trait, fill = Mean_Accuracy)
+) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  facet_wrap(~Model, ncol = 2) +
+  labs(
+    x = "Training population size",
+    y = "Trait",
+    fill = "Accuracy"
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 8, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 8, color = "black"),
+    axis.text.x  = element_text(face = "plain", size = 7, color = "black"),
+    axis.text.y  = element_text(face = "plain", size = 7, color = "black"),
+    strip.text   = element_text(face = "bold", size = 7, color = "black"),
+    legend.title = element_text(face = "plain", size = 7, color = "black"),
+    legend.text  = element_text(face = "plain", size = 6, color = "black"),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+ggsave(
+  filename = file.path(outdir, "Figure_main_heatmap_population_size_effect_2018.pdf"),
+  plot = p_heat,
+  width = 6.0,
+  height = 4.5,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "Figure_main_heatmap_population_size_effect_2018.png"),
+  plot = p_heat,
+  width = 6.0,
+  height = 4.5,
+  units = "in",
+  dpi = 600
+)
+
+############################################################
+# SUPPLEMENTARY FIGURE
+############################################################
+p_overall <- ggplot(
+  overall_df,
+  aes(x = Train_Fraction_of_Pool, y = Mean_Accuracy, color = Model, group = Model)
+) +
+  geom_line(linewidth = 0.45) +
+  geom_point(size = 1.1) +
+  geom_errorbar(
+    aes(ymin = Mean_Accuracy - SE_Accuracy, ymax = Mean_Accuracy + SE_Accuracy),
+    width = 0.03,
+    linewidth = 0.25
+  ) +
+  scale_x_continuous(
+    breaks = train_fracs,
+    labels = c("20", "40", "60", "80", "100")
+  ) +
+  labs(
+    x = "Training population size (% of current training partition)",
+    y = "Mean prediction accuracy",
+    color = "Model"
+  ) +
+  theme_pub +
+  theme(
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = file.path(outdir, "Figure_S1_overall_population_size_effect_2018.pdf"),
+  plot = p_overall,
+  width = 2.5,
+  height = 1.5,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "Figure_S1_overall_population_size_effect_2018.png"),
+  plot = p_overall,
+  width = 2.5,
+  height = 1.5,
+  units = "in",
+  dpi = 600
+)
+
+log_message("FINAL production run done successfully")
