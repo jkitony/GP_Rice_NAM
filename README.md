@@ -17,16 +17,17 @@ The study compares **low-density GBS markers** and **high-density projected SNPs
 ---
 
 ## Data
-- **Population:** aus-derived rice NAM  
-- **Genotypes:** GBS SNPs and projected SNPs from WGS of the parental lines 
-- **Phenotypes:** multiple agronomic traits  
+- **Phenotypes:** Eleven agronomic traits  
+- **Genotypes:** GBS SNPs (14 families) and WGS of the parental lines (7 diversity donors + T65 japonica rice common parent)
+
 
 ---
 
 ## Methods
 - **Genomic Prediction:** BGLR (GBLUP, Bayesian models, RKHS)  
-- **GWAS:** Mixed linear model (GAPIT)  
-- **Marker comparison:** low vs high density  
+- **GWAS:** Mixed linear model
+- **Marker comparison:** low to high density
+- **Population size comparison:** low to high density  
 
 ---
 
