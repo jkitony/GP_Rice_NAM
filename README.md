@@ -10,8 +10,8 @@ The study compares **low-density GBS markers** and **high-density projected SNPs
 ## Key Findings
 - GBS markers are sufficient for genomic prediction  
 - Higher marker density improves GWAS resolution  
-- Across evaluated models (**Bayesian, machine learning, and kernel-based**),  
-  **RKHS consistently achieved the highest prediction accuracy**  
+- Across evaluated models (**Bayesian and kernel-based**),  
+  **RKHS and Bayesian models showed superior performance**  with key differences driven by genetic architecture (traits) 
 - NAM populations provide an effective framework for jointly evaluating GP models and marker strategies  
 
 ---
