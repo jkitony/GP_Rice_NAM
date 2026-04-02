@@ -1,0 +1,236 @@
+rm(list = ls())
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(vcfR)
+  library(rrBLUP)
+  library(sommer)
+  library(dplyr)
+  library(ggplot2)
+})
+
+############################################################
+# User settings
+############################################################
+pheno_file <- "H2_phenos.txt"
+vcf_file   <- "Fourteen_projected_10k.vcf"
+outdir     <- "SNP_heritability_10k_2018"
+
+traits <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+############################################################
+# Helper: convert VCF genotypes to {-1,0,1}
+############################################################
+vcf_to_marker_matrix <- function(vcf_file) {
+  cat("Reading VCF:", vcf_file, "\n")
+  vcf <- read.vcfR(vcf_file, verbose = FALSE)
+  gt  <- extract.gt(vcf)
+  
+  M <- matrix(NA_real_, nrow = nrow(gt), ncol = ncol(gt))
+  M[gt %in% c("0/0", "0|0")] <- -1
+  M[gt %in% c("0/1", "1/0", "0|1", "1|0")] <- 0
+  M[gt %in% c("1/1", "1|1")] <- 1
+  
+  rownames(M) <- rownames(gt)   # marker IDs
+  colnames(M) <- colnames(gt)   # sample IDs
+  
+  X <- t(M)  # rows = genotypes, cols = markers
+  return(X)
+}
+
+############################################################
+# Read phenotype data
+############################################################
+cat("Loading phenotype data...\n")
+pheno <- read.table(pheno_file, header = TRUE, stringsAsFactors = FALSE, sep = "\t")
+
+# Keep 2018 only
+pheno <- pheno %>% filter(Year == 18)
+
+# Make sure required columns exist
+required_cols <- c("Genotype", "Family", "Year", traits)
+missing_cols <- setdiff(required_cols, colnames(pheno))
+if (length(missing_cols) > 0) {
+  stop("Missing columns in phenotype file: ", paste(missing_cols, collapse = ", "))
+}
+
+############################################################
+# Read VCF and compute genomic relationship matrix
+############################################################
+X <- vcf_to_marker_matrix(vcf_file)
+
+cat("Imputing missing genotypes (mean imputation)...\n")
+
+# Mean imputation per marker (column)
+X_imp <- X
+for (j in 1:ncol(X_imp)) {
+  col <- X_imp[, j]
+  mean_val <- mean(col, na.rm = TRUE)
+  col[is.na(col)] <- mean_val
+  X_imp[, j] <- col
+}
+
+cat("Building genomic relationship matrix (GRM)...\n")
+
+G <- A.mat(X_imp)
+
+############################################################
+# Trait-wise SNP heritability
+# Model:
+#   y ~ Family (fixed)
+#   random = additive genomic effect using GRM
+#
+# h2 = Vg / (Vg + Ve)
+############################################################
+estimate_snp_h2 <- function(trait, pheno, G) {
+  cat("Processing trait:", trait, "\n")
+  
+  df <- pheno[, c("Genotype", "Family", trait)]
+  colnames(df)[3] <- "y"
+  df <- df[!is.na(df$y), , drop = FALSE]
+  
+  # Match phenotype to GRM
+  keep <- intersect(df$Genotype, rownames(G))
+  df <- df[df$Genotype %in% keep, , drop = FALSE]
+  
+  if (nrow(df) < 30) {
+    return(data.frame(
+      Trait = trait,
+      N = nrow(df),
+      Vg = NA_real_,
+      Ve = NA_real_,
+      h2 = NA_real_,
+      Note = "Too few lines after matching/filtering",
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Reorder to match GRM
+  keep <- unique(df$Genotype)
+  df <- df[match(keep, df$Genotype), , drop = FALSE]
+  Gsub <- G[keep, keep, drop = FALSE]
+  
+  df$Genotype <- as.factor(df$Genotype)
+  df$Family   <- as.factor(df$Family)
+  
+  fit <- tryCatch({
+    mmer(
+      y ~ Family,
+      random = ~ vsr(Genotype, Gu = Gsub),
+      rcov   = ~ units,
+      data   = df,
+      verbose = FALSE
+    )
+  }, error = function(e) {
+    message("Model failed for trait ", trait, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(fit)) {
+    return(data.frame(
+      Trait = trait,
+      N = nrow(df),
+      Vg = NA_real_,
+      Ve = NA_real_,
+      h2 = NA_real_,
+      Note = "Model failed",
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  vc <- summary(fit)$varcomp
+  vc_names <- rownames(vc)
+  
+  # Try to locate genomic and residual variance rows robustly
+  vg_idx <- grep("Genotype", vc_names)
+  ve_idx <- grep("units", vc_names)
+  
+  if (length(vg_idx) == 0 || length(ve_idx) == 0) {
+    return(data.frame(
+      Trait = trait,
+      N = nrow(df),
+      Vg = NA_real_,
+      Ve = NA_real_,
+      h2 = NA_real_,
+      Note = "Variance components not found",
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  Vg <- as.numeric(vc[vg_idx[1], "VarComp"])
+  Ve <- as.numeric(vc[ve_idx[1], "VarComp"])
+  h2 <- Vg / (Vg + Ve)
+  
+  data.frame(
+    Trait = trait,
+    N = nrow(df),
+    Vg = Vg,
+    Ve = Ve,
+    h2 = h2,
+    Note = "",
+    stringsAsFactors = FALSE
+  )
+}
+
+############################################################
+# Run all traits
+############################################################
+res <- bind_rows(lapply(traits, estimate_snp_h2, pheno = pheno, G = G))
+
+# Save results
+write.csv(res, file.path(outdir, "SNP_heritability_10k_2018.csv"), row.names = FALSE)
+
+cat("\nFinished SNP heritability analysis.\n")
+print(res)
+
+############################################################
+# Plot
+############################################################
+plot_df <- res %>%
+  mutate(Trait = factor(Trait, levels = traits))
+
+p <- ggplot(plot_df, aes(x = Trait, y = h2)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = ifelse(is.na(h2), "NA", sprintf("%.2f", h2))),
+            vjust = -0.3, size = 3) +
+  ylim(0, max(1, max(plot_df$h2, na.rm = TRUE) + 0.1)) +
+  labs(
+    x = "Trait",
+    y = expression("SNP heritability (" * h^2 * ")"),
+    title = "Marker-based SNP heritability"
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 11, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 11, color = "black"),
+    axis.text.x  = element_text(face = "bold", size = 10, color = "black", angle = 45, hjust = 1),
+    axis.text.y  = element_text(face = "bold", size = 10, color = "black"),
+    plot.title   = element_text(face = "bold", size = 12, hjust = 0.5, color = "black")
+  )
+
+ggsave(
+  filename = file.path(outdir, "SNP_heritability_10k_2018.pdf"),
+  plot = p,
+  width = 5.5,
+  height = 3.5,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "SNP_heritability_10k_2018.png"),
+  plot = p,
+  width = 5.5,
+  height = 3.5,
+  units = "in",
+  dpi = 600
+)
+
+############################################################
+# Optional trait ranking
+############################################################
+res_ranked <- res %>% arrange(desc(h2))
+write.csv(res_ranked, file.path(outdir, "SNP_heritability_10k_2018_ranked.csv"), row.names = FALSE)
+
+cat("\nOutputs written to:", outdir, "\n")
