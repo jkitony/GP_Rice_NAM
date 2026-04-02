@@ -8,7 +8,7 @@ from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 
 # Input file
-infile = "Phenos_2018_17fam_2249lines.csv"
+infile = "Phenos_2018_14fam_1822lines.csv"
 
 # Traits to include
 traits = ["DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR"]
@@ -19,6 +19,23 @@ df = pd.read_csv(infile)
 # Keep only selected traits and force numeric
 data = df[traits].apply(pd.to_numeric, errors="coerce")
 
+# Summary table
+summary_table = pd.DataFrame({
+    "Trait": traits,
+    "N": data.count().values,
+    "Mean": data.mean().values,
+    "SD": data.std().values,
+    "Min": data.min().values,
+    "Max": data.max().values
+})
+
+# Optional rounding
+summary_table[["Mean", "SD", "Min", "Max"]] = summary_table[["Mean", "SD", "Min", "Max"]].round(2)
+
+# Save summary table
+summary_table.to_csv("Phenos_2018_17fam_2249lines_summary_table.csv", index=False)
+
+print(summary_table)
 # Correlation matrix
 corr = data.corr(method="pearson")
 
@@ -99,7 +116,7 @@ cbar.ax.tick_params(labelsize=5)
 plt.tight_layout()
 
 # Save outputs
-plt.savefig("Phenos_2018_17fam_2249lines_correlation.png", dpi=600, bbox_inches="tight")
-plt.savefig("Phenos_2018_17fam_2249lines_correlation.pdf", bbox_inches="tight")
+plt.savefig("Phenos_2018_14fam_1822lines_correlation.png", dpi=600, bbox_inches="tight")
+plt.savefig("Phenos_2018_14fam_1822lines_correlation.pdf", bbox_inches="tight")
 
 plt.show()
