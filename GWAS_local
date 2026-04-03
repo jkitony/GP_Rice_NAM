@@ -1,4 +1,190 @@
-#Ehd1
+#Ehd1 example
+#LOCAL GWAS
+#(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS$
+#python prepare_local_ld_inputs.py
+#bash subset_local_region.sh
+#python plot_local_manhattan_ld.py
+
+bcftools query -l Fourteen_projected_40k.vcf.gz > vcf_samples.txt
+##Edit
+total_window_bp = 2_000_000
+lead_snp = "S10_17195869"
+trait_name = "DTH"
+outdir = Path("ld_region_DTH_chr10")
+
+##############################################################################################################
+#!/usr/bin/env python3
+
+from pathlib import Path
+import pandas as pd
+
+# =========================================================
+# User settings
+# =========================================================
+gwas_file = "results_gwas_56k_staggered/Fourteen_projected_40k/qtls/DTH_all_GWAS_results.csv"
+pheno_file = "semitrimmed_pheno.txt"
+vcf_samples_file = "vcf_samples.txt"
+
+trait_name = "DTH"
+year_col = "Year"
+sample_col = "Genotype"
+target_year = 18
+
+lead_snp = "S10_17195869"
+
+# Total width around SNP
+total_window_bp = 2_000_000
+half_window_bp = total_window_bp // 2
+
+outdir = Path("ld_region_DTH_chr10")
+outdir.mkdir(parents=True, exist_ok=True)
+
+region_info_file = outdir / "region_info.tsv"
+sample_file = outdir / f"{trait_name}_samples_for_LD.txt"
+missing_sample_file = outdir / f"{trait_name}_samples_missing_in_vcf.txt"
+
+# =========================================================
+# Read GWAS and get lead SNP position
+# =========================================================
+gwas = pd.read_csv(gwas_file)
+
+required_cols = ["SNP", "CHR", "BP", "P"]
+missing_cols = [c for c in required_cols if c not in gwas.columns]
+if missing_cols:
+    raise ValueError(f"Missing columns in GWAS file: {missing_cols}")
+
+gwas["CHR"] = pd.to_numeric(gwas["CHR"], errors="coerce")
+gwas["BP"] = pd.to_numeric(gwas["BP"], errors="coerce")
+gwas["P"] = pd.to_numeric(gwas["P"], errors="coerce")
+
+gwas = gwas[
+    gwas["CHR"].notna() &
+    gwas["BP"].notna() &
+    gwas["P"].notna()
+].copy()
+
+peak_row = gwas.loc[gwas["SNP"] == lead_snp].copy()
+if peak_row.empty:
+    raise ValueError(f"Lead SNP {lead_snp} not found in GWAS file.")
+peak_row = peak_row.iloc[0]
+
+peak_snp = str(peak_row["SNP"])
+peak_chr = int(peak_row["CHR"])
+peak_bp = int(peak_row["BP"])
+
+region_start = max(1, peak_bp - half_window_bp)
+region_end = peak_bp + half_window_bp
+region_string = f"{peak_chr}:{region_start}-{region_end}"
+
+# =========================================================
+# Read phenotype and build sample list
+# =========================================================
+pheno = pd.read_csv(pheno_file, sep=None, engine="python")
+
+needed = [year_col, sample_col, trait_name]
+missing_cols = [c for c in needed if c not in pheno.columns]
+if missing_cols:
+    raise ValueError(f"Missing phenotype columns: {missing_cols}")
+
+pheno[sample_col] = pheno[sample_col].astype(str).str.strip()
+
+pheno_samples = sorted(
+    pheno.loc[
+        (pheno[year_col] == target_year) &
+        (pheno[trait_name].notna()) &
+        (pheno[sample_col] != ""),
+        sample_col
+    ].unique()
+)
+
+with open(vcf_samples_file) as f:
+    vcf_samples = set(line.strip() for line in f if line.strip())
+
+kept_samples = sorted(set(pheno_samples) & vcf_samples)
+missing_samples = sorted(set(pheno_samples) - vcf_samples)
+
+with open(sample_file, "w") as f:
+    for s in kept_samples:
+        f.write(s + "\n")
+
+with open(missing_sample_file, "w") as f:
+    for s in missing_samples:
+        f.write(s + "\n")
+
+# =========================================================
+# Save region info
+# =========================================================
+region_df = pd.DataFrame([{
+    "trait": trait_name,
+    "peak_snp": peak_snp,
+    "peak_chr": peak_chr,
+    "peak_bp": peak_bp,
+    "total_window_bp": total_window_bp,
+    "half_window_bp": half_window_bp,
+    "region_start": region_start,
+    "region_end": region_end,
+    "region": region_string,
+    "n_samples_requested": len(pheno_samples),
+    "n_samples_in_vcf": len(kept_samples)
+}])
+
+region_df.to_csv(region_info_file, sep="\t", index=False)
+
+print("Done.")
+print(f"Lead SNP: {peak_snp}")
+print(f"Peak position: Chr{peak_chr}:{peak_bp:,}")
+print(f"Total window: {total_window_bp:,} bp")
+print(f"Half window: {half_window_bp:,} bp")
+print(f"Region: {region_string}")
+print(f"Trait-valid phenotype samples: {len(pheno_samples)}")
+print(f"Trait-valid samples in VCF: {len(kept_samples)}")
+print(f"Saved region info: {region_info_file}")
+print(f"Saved sample file: {sample_file}")
+
+DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+#!/usr/bin/env bash
+set -euo pipefail
+
+#edit
+VCF="Fourteen_projected_40k.vcf.gz"
+INFO="ld_region_DTH_chr10/region_info.tsv"
+OUTDIR="ld_region_DTH_chr10"
+mkdir -p "${OUTDIR}"
+
+REGION=$(awk -F'\t' 'NR==2 {print $9}' "${INFO}")
+SAMPLES="${OUTDIR}/DTH_samples_for_LD.txt"
+PREFIX="${OUTDIR}/DTH_local_region"
+
+echo "Using region: ${REGION}"
+echo "Using samples: ${SAMPLES}"
+
+bcftools view \
+  -r "${REGION}" \
+  -S "${SAMPLES}" \
+  -m2 -M2 \
+  -v snps \
+  -Ob \
+  -o "${PREFIX}.biallelic_snps.bcf" \
+  "${VCF}"
+
+bcftools index -f "${PREFIX}.biallelic_snps.bcf"
+
+bcftools view \
+  "${PREFIX}.biallelic_snps.bcf" \
+  -Oz \
+  -o "${PREFIX}.biallelic_snps.vcf.gz"
+
+bcftools index -f "${PREFIX}.biallelic_snps.vcf.gz"
+
+echo "Variants in subset:"
+bcftools view -H "${PREFIX}.biallelic_snps.vcf.gz" | wc -l
+
+echo "Samples in subset:"
+bcftools query -l "${PREFIX}.biallelic_snps.bcf" | wc -l
+
+DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+
+
 #!/usr/bin/env python3
 
 # =========================================================
