@@ -6,11 +6,7 @@
 #python plot_local_manhattan_ld.py
 
 bcftools query -l Fourteen_projected_40k.vcf.gz > vcf_samples.txt
-##Edit
-total_window_bp = 2_000_000
-lead_snp = "S10_17195869"
-trait_name = "DTH"
-outdir = Path("ld_region_DTH_chr10")
+
 
 ##############################################################################################################
 #!/usr/bin/env python3
