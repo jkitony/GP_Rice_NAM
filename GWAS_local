@@ -1,0 +1,827 @@
+#Ehd1
+#!/usr/bin/env python3
+
+# =========================================================
+# Final localized GWAS plotting script
+# Includes:
+#   1. Local Manhattan plot
+#   2. Local score panel
+#   3. Sharp downward triangular LD panel
+#   4. Gene model track
+#
+# Defaults requested:
+#   - show_gene_arrows = False
+#   - gene_label_mode = "auto"
+#   - max_gene_labels = 2
+#   - auto_label_strategy = "nearest_peak"
+#
+# Label handling:
+#   - gene labels rotated 90 degrees
+#   - simple alternating left/right offsets to reduce overlap
+# =========================================================
+
+from pathlib import Path
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from scipy.spatial.distance import squareform
+import allel
+
+# =========================================================
+# User settings
+# =========================================================
+gwas_file = "results_gwas_56k_staggered/Fourteen_projected_40k/qtls/DTH_all_GWAS_results.csv"
+region_info_file = "ld_region_DTH_chr10/region_info.tsv"
+regional_vcf = "ld_region_DTH_chr10/DTH_local_region.biallelic_snps.vcf.gz"
+gff_file = "locus.gff"
+
+outdir = Path("results_gwas_56k_staggered/Fourteen_projected_40k/plots/local_manhattan_ld")
+outdir.mkdir(parents=True, exist_ok=True)
+
+panel_name = "Fourteen_projected_40k"
+
+# significance thresholds
+fdr_cutoff_p = 0.000432796
+bonf_p = 1.25e-06
+
+# LD filtering
+min_maf = 0.01
+max_missing = 0.80
+max_snps_for_ld = 1000
+impute_missing = True
+
+# local score settings
+xi = 3.0
+min_region_snps = 3
+merge_gap_bp = 50_000
+
+# local score display
+show_reverse_local_score = False
+
+# point fading
+fade_nonsig_points = True
+
+# gene track options
+show_gene_track = True
+show_gene_labels = True
+show_gene_arrows = False
+
+# label mode: "auto", "manual", "none"
+gene_label_mode = "manual"
+manual_gene_labels = ["Os10g0463400"]  # used only when gene_label_mode == "manual"
+
+# auto labeling
+max_gene_labels = 2
+label_genes_only_in_detected_region = True
+auto_label_strategy = "nearest_peak"   # "nearest_peak" or "detected_region"
+
+# gene track display
+gene_track_lanes = 1
+gene_label_fontsize = 7
+gene_label_rotation = 90
+gene_label_push_bp = 18_000   # horizontal push left/right to reduce overlap
+
+# figure size
+fig_w = 6.0
+fig_h = 7.0
+dpi = 600
+
+# =========================================================
+# Helpers
+# =========================================================
+def bp_to_mb(x):
+    return x / 1_000_000.0
+
+def mb_ticks(start_bp, end_bp, step_mb=0.5):
+    start_mb = math.floor(bp_to_mb(start_bp) / step_mb) * step_mb
+    end_mb = math.ceil(bp_to_mb(end_bp) / step_mb) * step_mb
+    vals_mb = np.arange(start_mb, end_mb + 1e-9, step_mb)
+    vals_bp = vals_mb * 1_000_000
+    return vals_bp, [f"{v:.2f} Mb" for v in vals_mb]
+
+def bh_fdr(pvalues):
+    pvalues = np.asarray(pvalues, dtype=float)
+    n = len(pvalues)
+    order = np.argsort(pvalues)
+    ranked = pvalues[order]
+    adj = ranked * n / np.arange(1, n + 1)
+    adj = np.minimum.accumulate(adj[::-1])[::-1]
+    adj = np.clip(adj, 0, 1)
+    out = np.empty(n, dtype=float)
+    out[order] = adj
+    return out
+
+def coerce_chr(x):
+    s = str(x)
+    s = s.replace("Chr", "").replace("chr", "")
+    try:
+        return int(float(s))
+    except Exception:
+        return np.nan
+
+def normalize_chr_label(x):
+    s = str(x).strip()
+    s = s.replace("Chr", "").replace("chr", "")
+    s = s.lstrip("0") or "0"
+    return s
+
+def thin_by_position(pos, max_snps):
+    n = len(pos)
+    if n <= max_snps:
+        return np.arange(n)
+    return np.unique(np.linspace(0, n - 1, max_snps).astype(int))
+
+def mean_impute_genotypes(gn_array):
+    gn_float = gn_array.astype(float).copy()
+    gn_float[gn_float < 0] = np.nan
+    for i in range(gn_float.shape[0]):
+        row = gn_float[i]
+        if np.isnan(row).any():
+            row_mean = np.nanmean(row)
+            if np.isnan(row_mean):
+                row_mean = 0.0
+            row[np.isnan(row)] = row_mean
+            gn_float[i] = row
+    return gn_float
+
+def make_ld_triangle(pos_array, r2_matrix):
+    tri_x, tri_y, tri_val = [], [], []
+    n = len(pos_array)
+    for i in range(n):
+        for j in range(i + 1):
+            x = (pos_array[i] + pos_array[j]) / 2.0
+            y = (pos_array[i] - pos_array[j]) / 2.0
+            tri_x.append(x)
+            tri_y.append(y)
+            tri_val.append(r2_matrix[i, j])
+    return np.array(tri_x), np.array(tri_y), np.array(tri_val)
+
+def lindley_segment(scores):
+    h = np.zeros(len(scores), dtype=float)
+    cur = 0.0
+    cur_start = 0
+    best_start = 0
+    best_end = 0
+    best_max = -np.inf
+
+    for i, s in enumerate(scores):
+        if cur + s > 0:
+            if cur == 0:
+                cur_start = i
+            cur = cur + s
+        else:
+            cur = 0.0
+
+        h[i] = cur
+
+        if cur > best_max:
+            best_max = cur
+            best_start = cur_start
+            best_end = i
+
+    return h, best_start, best_end, best_max
+
+def get_positive_segments(score_series, bp_series, min_region_snps=3, merge_gap_bp=50000):
+    positive = score_series > 0
+    segments = []
+    start = None
+
+    for i, flag in enumerate(positive):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            end = i - 1
+            if (end - start + 1) >= min_region_snps:
+                segments.append([start, end])
+            start = None
+
+    if start is not None:
+        end = len(score_series) - 1
+        if (end - start + 1) >= min_region_snps:
+            segments.append([start, end])
+
+    if not segments:
+        return []
+
+    merged = [segments[0]]
+    for seg in segments[1:]:
+        prev = merged[-1]
+        gap = bp_series[seg[0]] - bp_series[prev[1]]
+        if gap <= merge_gap_bp:
+            prev[1] = seg[1]
+        else:
+            merged.append(seg)
+
+    return merged
+
+def choose_segment_containing_peak(segments, bp_series, peak_bp):
+    if not segments:
+        return None
+
+    for s, e in segments:
+        if bp_series[s] <= peak_bp <= bp_series[e]:
+            return (s, e)
+
+    mids = [((bp_series[s] + bp_series[e]) / 2.0) for s, e in segments]
+    idx = int(np.argmin(np.abs(np.array(mids) - peak_bp)))
+    return tuple(segments[idx])
+
+def parse_gff_attributes(attr_string):
+    attrs = {}
+    for item in attr_string.strip().split(";"):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            attrs[k] = v
+    return attrs
+
+def load_genes_from_gff(gff_path, peak_chr, region_start, region_end):
+    target = normalize_chr_label(peak_chr)
+    genes = []
+
+    with open(gff_path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9:
+                continue
+
+            chrom, source, feature, start, end, score, strand, phase, attrs = parts
+            if feature != "gene":
+                continue
+
+            if normalize_chr_label(chrom) != target:
+                continue
+
+            start = int(start)
+            end = int(end)
+
+            if end < region_start or start > region_end:
+                continue
+
+            parsed = parse_gff_attributes(attrs)
+            gene_id = parsed.get("ID", "NA")
+            gene_name = parsed.get("Name", gene_id)
+            note = parsed.get("Note", "")
+
+            genes.append({
+                "chrom": chrom,
+                "start": start,
+                "end": end,
+                "strand": strand,
+                "gene_id": gene_id,
+                "gene_name": gene_name,
+                "note": note
+            })
+
+    genes_df = pd.DataFrame(genes)
+    if genes_df.empty:
+        return genes_df
+
+    genes_df = genes_df.sort_values(["start", "end"]).reset_index(drop=True)
+    return genes_df
+
+def assign_gene_lanes(genes_df, n_lanes=2):
+    if genes_df.empty:
+        return genes_df
+
+    lane_ends = [-np.inf] * n_lanes
+    lanes = []
+
+    for _, row in genes_df.iterrows():
+        placed = False
+        for lane_idx in range(n_lanes):
+            if row["start"] > lane_ends[lane_idx]:
+                lanes.append(lane_idx)
+                lane_ends[lane_idx] = row["end"]
+                placed = True
+                break
+        if not placed:
+            best_lane = int(np.argmin(lane_ends))
+            lanes.append(best_lane)
+            lane_ends[best_lane] = row["end"]
+
+    genes_df = genes_df.copy()
+    genes_df["lane"] = lanes
+    return genes_df
+
+# soft LD colormap
+ld_cmap = LinearSegmentedColormap.from_list(
+    "ld_soft",
+    [
+        (0.00, "#f2f2f2"),
+        (0.15, "#ebeff5"),
+        (0.35, "#d6e2f0"),
+        (0.55, "#b8d1ea"),
+        (0.72, "#f6e58d"),
+        (0.87, "#f5b041"),
+        (1.00, "#d35400"),
+    ]
+)
+
+# =========================================================
+# 1. Read region info
+# =========================================================
+info = pd.read_csv(region_info_file, sep="\t").iloc[0]
+
+trait_name = str(info["trait"])
+peak_snp = str(info["peak_snp"])
+peak_chr = int(info["peak_chr"])
+peak_bp = int(info["peak_bp"])
+region_start = int(info["region_start"])
+region_end = int(info["region_end"])
+
+print(f"Trait: {trait_name}")
+print(f"Peak SNP: {peak_snp}")
+print(f"Region: Chr{peak_chr}:{region_start:,}-{region_end:,}")
+
+# =========================================================
+# 2. Read GWAS
+# =========================================================
+gwas = pd.read_csv(gwas_file)
+
+required_cols = ["SNP", "CHR", "BP", "P"]
+missing_cols = [c for c in required_cols if c not in gwas.columns]
+if missing_cols:
+    raise ValueError(f"Missing columns in GWAS file: {missing_cols}")
+
+gwas["CHR"] = gwas["CHR"].map(coerce_chr)
+gwas["BP"] = pd.to_numeric(gwas["BP"], errors="coerce")
+gwas["P"] = pd.to_numeric(gwas["P"], errors="coerce")
+
+gwas = gwas[
+    gwas["CHR"].notna() &
+    gwas["BP"].notna() &
+    gwas["P"].notna() &
+    np.isfinite(gwas["P"]) &
+    (gwas["P"] > 0)
+].copy()
+
+if "FDR" not in gwas.columns:
+    gwas["FDR"] = bh_fdr(gwas["P"].values)
+
+local_gwas = gwas[
+    (gwas["CHR"] == peak_chr) &
+    (gwas["BP"] >= region_start) &
+    (gwas["BP"] <= region_end)
+].copy()
+
+if local_gwas.empty:
+    raise ValueError("No GWAS points found in selected region.")
+
+local_gwas = local_gwas.sort_values("BP").reset_index(drop=True)
+local_gwas["logP"] = -np.log10(local_gwas["P"])
+
+peak_rows = local_gwas[
+    (local_gwas["SNP"] == peak_snp) | (local_gwas["BP"] == peak_bp)
+].copy()
+
+fdr_line = -np.log10(fdr_cutoff_p)
+bonf_line = -np.log10(bonf_p)
+ymax = max(local_gwas["logP"].max(), fdr_line, bonf_line) + 0.7
+
+# =========================================================
+# 3. Local score
+# =========================================================
+local_gwas["score"] = local_gwas["logP"] - xi
+
+forward_ls, _, _, _ = lindley_segment(local_gwas["score"].values)
+local_gwas["local_score_forward"] = forward_ls
+
+if show_reverse_local_score:
+    rev_scores = local_gwas["score"].values[::-1]
+    reverse_ls_rev, _, _, _ = lindley_segment(rev_scores)
+    local_gwas["local_score_reverse"] = reverse_ls_rev[::-1]
+else:
+    local_gwas["local_score_reverse"] = np.nan
+
+segments = get_positive_segments(
+    local_gwas["score"].values,
+    local_gwas["BP"].values,
+    min_region_snps=min_region_snps,
+    merge_gap_bp=merge_gap_bp
+)
+
+chosen_segment = choose_segment_containing_peak(
+    segments,
+    local_gwas["BP"].values,
+    peak_bp
+)
+
+if chosen_segment is not None:
+    seg_start_idx, seg_end_idx = chosen_segment
+    detected_start_bp = int(local_gwas.loc[seg_start_idx, "BP"])
+    detected_end_bp = int(local_gwas.loc[seg_end_idx, "BP"])
+else:
+    detected_start_bp = None
+    detected_end_bp = None
+
+score_line_threshold = bonf_line - xi
+score_ymin = min(local_gwas["score"].min(), -0.5)
+score_ymax = max(local_gwas["local_score_forward"].max(), 0) + 0.6
+
+# =========================================================
+# 4. Read VCF and compute LD
+# =========================================================
+callset = allel.read_vcf(
+    regional_vcf,
+    fields=["variants/CHROM", "variants/POS", "variants/ID", "calldata/GT"]
+)
+
+if callset is None:
+    raise ValueError("Could not read regional VCF.")
+
+pos = np.asarray(callset["variants/POS"])
+vid = np.asarray(callset["variants/ID"], dtype=object)
+gt = allel.GenotypeArray(callset["calldata/GT"])
+gn = gt.to_n_alt(fill=-1)
+
+missing_rate = (gn < 0).sum(axis=1) / gn.shape[1]
+
+gn_float_tmp = gn.astype(float)
+gn_float_tmp[gn_float_tmp < 0] = np.nan
+alt_af = np.nanmean(gn_float_tmp, axis=1) / 2.0
+maf = np.minimum(alt_af, 1 - alt_af)
+
+keep = (
+    np.isfinite(maf) &
+    (maf >= min_maf) &
+    (missing_rate <= max_missing)
+)
+
+pos2 = pos[keep]
+vid2 = vid[keep]
+gn2 = gn[keep, :]
+
+if len(pos2) < 3:
+    raise ValueError("Too few SNPs remain after LD filtering.")
+
+sel = thin_by_position(pos2, max_snps_for_ld)
+pos2 = pos2[sel]
+vid2 = vid2[sel]
+gn2 = gn2[sel, :]
+
+gn_ld = mean_impute_genotypes(gn2) if impute_missing else gn2.astype(float)
+
+r = allel.rogers_huff_r(gn_ld)
+r2_condensed = np.square(r)
+r2 = squareform(r2_condensed)
+np.fill_diagonal(r2, 1.0)
+
+lead_idx = None
+for i, sid in enumerate(vid2):
+    if sid == peak_snp:
+        lead_idx = i
+        break
+if lead_idx is None:
+    bp_matches = np.where(pos2 == peak_bp)[0]
+    if len(bp_matches) > 0:
+        lead_idx = int(bp_matches[0])
+
+local_gwas["lead_r2"] = np.nan
+if lead_idx is not None:
+    ld_df = pd.DataFrame({
+        "BP": pos2,
+        "lead_r2": r2[:, lead_idx]
+    })
+    local_gwas = local_gwas.merge(ld_df, on="BP", how="left", suffixes=("", "_ld"))
+    if "lead_r2_ld" in local_gwas.columns:
+        local_gwas["lead_r2"] = local_gwas["lead_r2_ld"]
+        local_gwas.drop(columns=["lead_r2_ld"], inplace=True)
+
+local_gwas["point_class"] = "background"
+local_gwas.loc[local_gwas["P"] <= fdr_cutoff_p, "point_class"] = "sig"
+local_gwas.loc[local_gwas["SNP"] == peak_snp, "point_class"] = "lead"
+
+tri_x, tri_y, tri_val = make_ld_triangle(pos2, r2)
+
+# =========================================================
+# 5. Load genes
+# =========================================================
+if show_gene_track:
+    genes_df = load_genes_from_gff(gff_file, peak_chr, region_start, region_end)
+else:
+    genes_df = pd.DataFrame()
+
+if not genes_df.empty:
+    genes_df = assign_gene_lanes(genes_df, n_lanes=gene_track_lanes)
+
+    if not show_gene_labels or gene_label_mode == "none":
+        label_df = pd.DataFrame()
+
+    elif gene_label_mode == "manual":
+        label_df = genes_df[genes_df["gene_id"].isin(manual_gene_labels)].copy()
+
+    elif gene_label_mode == "auto":
+        if label_genes_only_in_detected_region and detected_start_bp is not None and detected_end_bp is not None:
+            candidate_df = genes_df[
+                (genes_df["end"] >= detected_start_bp) &
+                (genes_df["start"] <= detected_end_bp)
+            ].copy()
+        else:
+            candidate_df = genes_df.copy()
+
+        if candidate_df.empty:
+            label_df = pd.DataFrame()
+        else:
+            if auto_label_strategy == "nearest_peak":
+                candidate_df["dist_to_peak"] = (
+                    ((candidate_df["start"] + candidate_df["end"]) / 2) - peak_bp
+                ).abs()
+                label_df = candidate_df.sort_values("dist_to_peak").head(max_gene_labels).copy()
+            elif auto_label_strategy == "detected_region":
+                if detected_start_bp is not None and detected_end_bp is not None:
+                    detected_center = (detected_start_bp + detected_end_bp) / 2
+                else:
+                    detected_center = peak_bp
+                candidate_df["dist_to_center"] = (
+                    ((candidate_df["start"] + candidate_df["end"]) / 2) - detected_center
+                ).abs()
+                label_df = candidate_df.sort_values("dist_to_center").head(max_gene_labels).copy()
+            else:
+                label_df = candidate_df.head(max_gene_labels).copy()
+    else:
+        label_df = pd.DataFrame()
+else:
+    label_df = pd.DataFrame()
+
+# =========================================================
+# 6. Common x ticks in Mb
+# =========================================================
+xticks_bp, xtick_labels = mb_ticks(region_start, region_end, step_mb=0.5)
+
+# =========================================================
+# 7. Plot with dedicated colorbar column
+# =========================================================
+fig = plt.figure(figsize=(fig_w, fig_h))
+gs = GridSpec(
+    4, 2,
+    width_ratios=[30, 1.2],
+    height_ratios=[2.0, 1.2, 1.2, 0.9],
+    hspace=0.05,
+    wspace=0.08
+)
+
+ax1 = fig.add_subplot(gs[0, 0])
+ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
+ax4 = fig.add_subplot(gs[3, 0], sharex=ax1)
+
+cax1 = fig.add_subplot(gs[0, 1])
+cax2 = fig.add_subplot(gs[1, 1])
+cax3 = fig.add_subplot(gs[2, 1])
+cax4 = fig.add_subplot(gs[3, 1])
+
+# ---------- Panel 1: local Manhattan ----------
+if fade_nonsig_points:
+    bg = local_gwas[
+        local_gwas["lead_r2"].isna() | (local_gwas["point_class"] == "background")
+    ]
+else:
+    bg = local_gwas[local_gwas["lead_r2"].isna()]
+
+if not bg.empty:
+    ax1.scatter(
+        bg["BP"], bg["logP"],
+        s=10, color="#d9d9d9", alpha=0.75, edgecolors="none", zorder=1
+    )
+
+col_points = local_gwas[
+    local_gwas["lead_r2"].notna() &
+    ((local_gwas["point_class"] != "background") | (~fade_nonsig_points))
+].copy()
+
+scatter_ld = None
+if not col_points.empty:
+    scatter_ld = ax1.scatter(
+        col_points["BP"], col_points["logP"],
+        c=col_points["lead_r2"],
+        cmap=ld_cmap, norm=Normalize(vmin=0, vmax=1),
+        s=18, edgecolors="none", zorder=2
+    )
+
+if not peak_rows.empty:
+    ax1.scatter(
+        peak_rows["BP"], peak_rows["logP"],
+        s=36, color="#c0392b", edgecolors="black", linewidths=0.35, zorder=3
+    )
+
+if detected_start_bp is not None and detected_end_bp is not None:
+    ax1.axvspan(detected_start_bp, detected_end_bp, color="#7DCEA0", alpha=0.22, zorder=0)
+
+ax1.axhline(fdr_line, color="#4c72b0", linewidth=0.8)
+ax1.axhline(bonf_line, color="#c0392b", linestyle="--", linewidth=0.8)
+ax1.axvline(peak_bp, color="#239B56", linestyle="-", linewidth=0.8)
+
+ax1.text(
+    peak_bp, ymax - 0.08, peak_snp,
+    ha="center", va="top", fontsize=7, fontweight="bold"
+)
+
+ax1.set_xlim(region_start, region_end)
+ax1.set_ylim(0, ymax)
+ax1.set_ylabel(r"$-\log_{10}(P)$", fontsize=10, fontweight="bold")
+ax1.set_xticks(xticks_bp)
+ax1.set_xticklabels([])
+ax1.tick_params(axis="x", which="both", length=3, labelbottom=False)
+ax1.tick_params(axis="y", labelsize=7, width=0.8)
+
+for label in ax1.get_yticklabels():
+    label.set_fontweight("bold")
+
+ax1.spines["top"].set_visible(False)
+ax1.spines["right"].set_visible(False)
+ax1.spines["left"].set_linewidth(0.8)
+ax1.spines["bottom"].set_linewidth(0.8)
+
+if scatter_ld is not None and lead_idx is not None:
+    cbar1 = fig.colorbar(scatter_ld, cax=cax1)
+    cbar1.set_label("LD with lead SNP\n($r^2$)", fontsize=7, fontweight="bold")
+    cbar1.ax.tick_params(labelsize=6, width=0.7)
+    for label in cbar1.ax.get_yticklabels():
+        label.set_fontweight("bold")
+else:
+    cax1.axis("off")
+
+# ---------- Panel 2: score / local score ----------
+ax2.scatter(
+    local_gwas["BP"], local_gwas["score"],
+    s=10, color="black", alpha=0.8, edgecolors="none", zorder=1
+)
+
+ax2.plot(
+    local_gwas["BP"], local_gwas["local_score_forward"],
+    color="red", linewidth=1.0, zorder=2
+)
+
+if show_reverse_local_score:
+    ax2.plot(
+        local_gwas["BP"], local_gwas["local_score_reverse"],
+        color="red", linewidth=0.9, linestyle="--", zorder=2
+    )
+
+if detected_start_bp is not None and detected_end_bp is not None:
+    ax2.axvspan(detected_start_bp, detected_end_bp, color="#7DCEA0", alpha=0.22, zorder=0)
+    ax2.hlines(
+        y=score_ymax * 0.92,
+        xmin=detected_start_bp,
+        xmax=detected_end_bp,
+        color="#239B56",
+        linewidth=2.0
+    )
+
+ax2.axhline(score_line_threshold, color="black", linestyle=":", linewidth=0.8)
+ax2.axvline(peak_bp, color="#239B56", linestyle="-", linewidth=0.8)
+
+ax2.set_ylabel("Score", fontsize=8, fontweight="bold")
+ax2.set_ylim(score_ymin, score_ymax)
+ax2.set_xticks(xticks_bp)
+ax2.set_xticklabels([])
+ax2.tick_params(axis="x", which="both", length=3, labelbottom=False)
+ax2.tick_params(axis="y", labelsize=7, width=0.8)
+
+for label in ax2.get_yticklabels():
+    label.set_fontweight("bold")
+
+ax2.spines["top"].set_visible(False)
+ax2.spines["right"].set_visible(False)
+ax2.spines["left"].set_linewidth(0.8)
+ax2.spines["bottom"].set_linewidth(0.8)
+
+cax2.axis("off")
+
+# ---------- Panel 3: triangular LD ----------
+ld_sc = ax3.scatter(
+    tri_x, -tri_y,
+    c=tri_val,
+    cmap=ld_cmap, norm=Normalize(vmin=0, vmax=1),
+    marker="D", s=18, linewidths=0
+)
+
+if detected_start_bp is not None and detected_end_bp is not None:
+    ax3.axvspan(detected_start_bp, detected_end_bp, color="#7DCEA0", alpha=0.12, zorder=0)
+
+ax3.set_xlim(region_start, region_end)
+ax3.set_ylim(-max(tri_y) * 1.03, 0.02 * max(tri_y))
+ax3.set_yticks([])
+ax3.set_ylabel("")
+ax3.set_xticks(xticks_bp)
+ax3.set_xticklabels([])
+ax3.tick_params(axis="x", which="both", length=3, labelbottom=False)
+
+for spine in ["top", "right", "left"]:
+    ax3.spines[spine].set_visible(False)
+ax3.spines["bottom"].set_linewidth(0.8)
+
+cbar2 = fig.colorbar(ld_sc, cax=cax3)
+cbar2.set_label(r"$r^2$", fontsize=8, fontweight="bold")
+cbar2.ax.tick_params(labelsize=7, width=0.8)
+for label in cbar2.ax.get_yticklabels():
+    label.set_fontweight("bold")
+
+# ---------- Panel 4: gene track ----------
+if detected_start_bp is not None and detected_end_bp is not None:
+    ax4.axvspan(detected_start_bp, detected_end_bp, color="#7DCEA0", alpha=0.12, zorder=0)
+
+if not show_gene_track:
+    ax4.text(
+        0.5, 0.5, "Gene track disabled",
+        transform=ax4.transAxes, ha="center", va="center",
+        fontsize=7
+    )
+    ax4.set_ylim(0, 1)
+
+elif genes_df.empty:
+    ax4.text(
+        0.5, 0.5, "No genes in selected interval",
+        transform=ax4.transAxes, ha="center", va="center",
+        fontsize=7
+    )
+    ax4.set_ylim(0, 1)
+
+else:
+    lane_y = np.linspace(0.25, 0.85, gene_track_lanes)
+
+    for _, row in genes_df.iterrows():
+        y = lane_y[int(row["lane"])]
+        ax4.plot(
+            [row["start"], row["end"]],
+            [y, y],
+            color="black",
+            linewidth=1.0,
+            solid_capstyle="butt"
+        )
+
+        if show_gene_arrows:
+            if row["strand"] == "+":
+                ax4.plot(row["end"], y, marker=">", color="black", markersize=4)
+            else:
+                ax4.plot(row["start"], y, marker="<", color="black", markersize=4)
+
+    if not label_df.empty:
+        label_df = label_df.copy().reset_index(drop=True)
+        for i, (_, row) in enumerate(label_df.iterrows()):
+            y = lane_y[int(row["lane"])]
+            mid_bp = int((row["start"] + row["end"]) / 2)
+
+            # alternate left/right pushes to reduce overlap
+            if i % 2 == 0:
+                label_x = max(region_start, mid_bp - gene_label_push_bp)
+                ha = "right"
+            else:
+                label_x = min(region_end, mid_bp + gene_label_push_bp)
+                ha = "left"
+
+            ax4.text(
+                label_x,
+                y + 0.10,
+                row["gene_id"],
+                fontsize=gene_label_fontsize,
+                rotation=gene_label_rotation,
+                ha=ha,
+                va="bottom"
+            )
+
+    ax4.set_ylim(0.05, 1.0)
+
+ax4.set_yticks([])
+ax4.set_ylabel("Genes", fontsize=8, fontweight="bold")
+ax4.set_xlabel(f"Chromosome {peak_chr} position (Mb)", fontsize=8, fontweight="bold")
+ax4.set_xticks(xticks_bp)
+ax4.set_xticklabels(xtick_labels, fontsize=7, fontweight="bold")
+ax4.tick_params(axis="x", width=0.8)
+
+for spine in ["top", "right", "left"]:
+    ax4.spines[spine].set_visible(False)
+ax4.spines["bottom"].set_linewidth(0.8)
+
+cax4.axis("off")
+
+# =========================================================
+# 8. Save
+# =========================================================
+window_label = f"{region_start}_{region_end}"
+prefix = outdir / f"{trait_name}_Chr{peak_chr}_{window_label}_localscore_triangle_ld_genes"
+
+plt.savefig(f"{prefix}.png", dpi=dpi, bbox_inches="tight")
+plt.savefig(f"{prefix}.pdf", bbox_inches="tight")
+plt.close()
+
+print("\nDone.")
+print(f"Panel: {panel_name}")
+print(f"Trait: {trait_name}")
+print(f"Peak SNP: {peak_snp}")
+print(f"Region: Chr{peak_chr}:{region_start:,}-{region_end:,}")
+print(f"Reverse local score shown: {show_reverse_local_score}")
+print(f"Gene arrows shown: {show_gene_arrows}")
+print(f"Gene label mode: {gene_label_mode}")
+if detected_start_bp is not None and detected_end_bp is not None:
+    print(f"Detected local-score region: Chr{peak_chr}:{detected_start_bp:,}-{detected_end_bp:,}")
+print(f"Genes plotted: {0 if genes_df.empty else len(genes_df)}")
+print(f"Gene labels plotted: {0 if label_df.empty else len(label_df)}")
+print(f"Saved: {prefix}.png")
+print(f"Saved: {prefix}.pdf")
