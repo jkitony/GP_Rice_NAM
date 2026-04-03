@@ -1,3 +1,14 @@
+#Ehd1 example
+#LOCAL GWAS
+#(base) jkitony@jkitony:/mnt/c/Rice/2026/GWAS$
+#python prepare_local_ld_inputs.py
+#bash subset_local_region.sh
+#python plot_local_manhattan_ld.py
+
+bcftools query -l Fourteen_projected_40k.vcf.gz > vcf_samples.txt
+#######################################################################
+
+
 #!/usr/bin/env python3
 
 from pathlib import Path
