@@ -1,0 +1,622 @@
+#!/usr/bin/env Rscript
+
+############################################################
+# Genomic prediction of cross performance among aus-NAM parents
+# Using:
+#   - Fourteen_1709_56k.vcf
+#   - 2018 phenotypes from semitrimmed_pheno.txt
+#
+# Outputs per trait:
+#   1. Predicted cross mean
+#   2. Parent GEBVs
+#   3. Mid-parent GEBV
+#   4. Approximate within-cross additive variance/SD
+#   5. Usefulness Criterion (UC)
+#
+# Notes:
+# - Uses rrBLUP marker-effect model
+# - Cross variance here is approximate:
+#   based on segregating loci and marker effects
+#   without explicit recombination modeling
+############################################################
+
+suppressPackageStartupMessages({
+  library(vcfR)
+  library(rrBLUP)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(stringr)
+  library(ggplot2)
+})
+
+rm(list = ls())
+
+############################################################
+# User settings
+############################################################
+pheno_file <- "semitrimmed_pheno.txt"
+vcf_file   <- "Fourteen_1709_56k.vcf"
+outdir     <- "cross_performance_rrBLUP_2018_56k"
+
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+trait_order <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+
+# All parents expected in the VCF
+parents <- c(
+  "T65",
+  "WRC02", "WRC04", "WRC27", "WRC28", "WRC29", "WRC30", "WRC31",
+  "WRC32", "WRC33", "WRC34", "WRC35", "WRC36", "WRC39", "WRC40"
+)
+
+# Mapping parent to NAM family
+parent_info <- data.frame(
+  Parent = parents,
+  Family = c(
+    "Common",
+    "WNAM02", "WNAM04", "WNAM27", "WNAM28", "WNAM29", "WNAM30", "WNAM31",
+    "WNAM32", "WNAM33", "WNAM34", "WNAM35", "WNAM36", "WNAM39", "WNAM40"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Usefulness criterion selection intensity
+# ~ top 10% selected
+selection_intensity <- 1.755
+
+############################################################
+# Helpers
+############################################################
+log_message <- function(...) {
+  cat(paste0(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "),
+             paste(..., collapse = ""), "\n"))
+}
+
+prepare_marker_matrix <- function(vcf_file) {
+  log_message("Reading VCF: ", vcf_file)
+  
+  vcf <- read.vcfR(vcf_file, verbose = FALSE)
+  gt  <- extract.gt(vcf)
+  
+  gt_score <- matrix(NA_real_, nrow = nrow(gt), ncol = ncol(gt))
+  
+  gt_score[gt == "0/0"] <- 0
+  gt_score[gt == "0|0"] <- 0
+  
+  gt_score[gt == "0/1"] <- 1
+  gt_score[gt == "1/0"] <- 1
+  gt_score[gt == "0|1"] <- 1
+  gt_score[gt == "1|0"] <- 1
+  
+  gt_score[gt == "1/1"] <- 2
+  gt_score[gt == "1|1"] <- 2
+  
+  rownames(gt_score) <- rownames(gt)
+  colnames(gt_score) <- colnames(gt)
+  
+  # rows = genotypes, cols = markers
+  X <- t(gt_score)
+  
+  imp <- A.mat(
+    X,
+    max.missing = 0.5,
+    impute.method = "mean",
+    return.imputed = TRUE
+  )
+  
+  X_imp <- imp$imputed
+  return(X_imp)
+}
+
+fit_rrblup_marker_model <- function(y, M_raw) {
+  marker_means <- colMeans(M_raw, na.rm = TRUE)
+  M_centered   <- sweep(M_raw, 2, marker_means, "-")
+  
+  fit <- mixed.solve(
+    y = y,
+    Z = M_centered
+  )
+  
+  list(
+    mu = as.numeric(fit$beta),
+    marker_effects = as.numeric(fit$u),
+    marker_means = marker_means
+  )
+}
+
+predict_line_values <- function(M_raw, fit_obj) {
+  M_centered <- sweep(M_raw, 2, fit_obj$marker_means, "-")
+  as.vector(fit_obj$mu + M_centered %*% fit_obj$marker_effects)
+}
+
+make_crosses <- function(parent_ids) {
+  combn(parent_ids, 2, simplify = FALSE) |>
+    lapply(function(x) {
+      data.frame(
+        Parent1 = x[1],
+        Parent2 = x[2],
+        stringsAsFactors = FALSE
+      )
+    }) |>
+    bind_rows()
+}
+
+predict_one_cross <- function(p1, p2, fit_obj, parent_markers, selection_intensity = 1.755) {
+  g1 <- as.numeric(parent_markers[p1, ])
+  g2 <- as.numeric(parent_markers[p2, ])
+  
+  # Expected progeny additive dosage
+  g_cross <- (g1 + g2) / 2
+  
+  # Center using training marker means
+  g1_centered      <- g1 - fit_obj$marker_means
+  g2_centered      <- g2 - fit_obj$marker_means
+  g_cross_centered <- g_cross - fit_obj$marker_means
+  
+  # Parent genomic values
+  p1_gebv <- as.numeric(fit_obj$mu + sum(g1_centered * fit_obj$marker_effects))
+  p2_gebv <- as.numeric(fit_obj$mu + sum(g2_centered * fit_obj$marker_effects))
+  
+  # Cross mean
+  pred_mean <- as.numeric(fit_obj$mu + sum(g_cross_centered * fit_obj$marker_effects))
+  
+  # Mid-parent GEBV
+  mid_parent_gebv <- mean(c(p1_gebv, p2_gebv))
+  
+  # Approximate additive variance from segregating loci
+  # 0 if same homozygous dosage
+  # beta^2 contribution if opposite homozygotes
+  # intermediate if one is heterozygous
+  seg_weight <- ((g1 - g2) / 2)^2
+  approx_var <- sum(seg_weight * (fit_obj$marker_effects^2), na.rm = TRUE)
+  approx_sd  <- sqrt(approx_var)
+  
+  uc <- pred_mean + selection_intensity * approx_sd
+  
+  data.frame(
+    Cross = paste(p1, "x", p2),
+    Parent1 = p1,
+    Parent2 = p2,
+    Predicted_Cross_Mean = pred_mean,
+    Parent1_GEBV = p1_gebv,
+    Parent2_GEBV = p2_gebv,
+    MidParent_GEBV = mid_parent_gebv,
+    Approx_Cross_SD = approx_sd,
+    Approx_Cross_Var = approx_var,
+    Usefulness_Criterion = uc,
+    stringsAsFactors = FALSE
+  )
+}
+
+############################################################
+# Load phenotype data
+############################################################
+log_message("Loading phenotype file")
+pheno <- read.table(pheno_file, header = TRUE, stringsAsFactors = FALSE)
+
+pheno18 <- pheno %>%
+  filter(Year == 18)
+
+log_message("2018 phenotype rows: ", nrow(pheno18))
+
+############################################################
+# Load genotype matrix
+############################################################
+X_all <- prepare_marker_matrix(vcf_file)
+
+log_message("Genotypes in VCF: ", nrow(X_all))
+log_message("Markers in VCF: ", ncol(X_all))
+
+############################################################
+# Check parent availability
+############################################################
+parents_present <- parents[parents %in% rownames(X_all)]
+parents_missing <- setdiff(parents, rownames(X_all))
+
+if (length(parents_missing) > 0) {
+  log_message("WARNING: These parents were not found in VCF: ",
+              paste(parents_missing, collapse = ", "))
+}
+
+if (length(parents_present) < 2) {
+  stop("Fewer than 2 parents found in the VCF. Cannot predict crosses.")
+}
+
+parent_markers <- X_all[parents_present, , drop = FALSE]
+
+############################################################
+# Build candidate cross table
+############################################################
+cross_df <- make_crosses(parents_present) %>%
+  left_join(parent_info, by = c("Parent1" = "Parent")) %>%
+  rename(Family1 = Family) %>%
+  left_join(parent_info, by = c("Parent2" = "Parent")) %>%
+  rename(Family2 = Family) %>%
+  mutate(
+    Cross = paste(Parent1, "x", Parent2),
+    Cross_Type = case_when(
+      Parent1 == "T65" | Parent2 == "T65" ~ "T65_x_Donor",
+      TRUE ~ "Donor_x_Donor"
+    )
+  )
+
+write.csv(
+  cross_df,
+  file.path(outdir, "candidate_parent_crosses.csv"),
+  row.names = FALSE
+)
+
+############################################################
+# Main loop over traits
+############################################################
+all_trait_results <- list()
+
+for (tr in trait_order) {
+  
+  if (!tr %in% colnames(pheno18)) {
+    log_message("Skipping missing trait column: ", tr)
+    next
+  }
+  
+  log_message("Running trait: ", tr)
+  
+  df_trait <- pheno18 %>%
+    filter(!is.na(.data[[tr]]))
+  
+  if (nrow(df_trait) < 30) {
+    log_message("Too few non-missing records for ", tr, "; skipping")
+    next
+  }
+  
+  common_ids <- intersect(df_trait$Genotype, rownames(X_all))
+  
+  if (length(common_ids) < 30) {
+    log_message("Too few matched genotype-phenotype records for ", tr, "; skipping")
+    next
+  }
+  
+  df_trait <- df_trait %>%
+    filter(Genotype %in% common_ids)
+  
+  # Align marker matrix with phenotype order
+  M_train <- X_all[df_trait$Genotype, , drop = FALSE]
+  y_train <- df_trait[[tr]]
+  
+  # Fit final rrBLUP model
+  fit_obj <- fit_rrblup_marker_model(y = y_train, M_raw = M_train)
+  
+  # Save training predictions
+  line_pred <- predict_line_values(M_train, fit_obj)
+  
+  train_out <- df_trait %>%
+    mutate(
+      Predicted_Value = line_pred,
+      Residual = .data[[tr]] - Predicted_Value
+    )
+  
+  write.csv(
+    train_out,
+    file.path(outdir, paste0("training_line_predictions_", tr, ".csv")),
+    row.names = FALSE
+  )
+  
+  # Predict all parental crosses
+  pred_df <- bind_rows(
+    lapply(seq_len(nrow(cross_df)), function(i) {
+      p1 <- cross_df$Parent1[i]
+      p2 <- cross_df$Parent2[i]
+      
+      predict_one_cross(
+        p1 = p1,
+        p2 = p2,
+        fit_obj = fit_obj,
+        parent_markers = parent_markers,
+        selection_intensity = selection_intensity
+      )
+    })
+  )
+  
+  # Clean join: join only by Parent1 and Parent2
+  trait_cross_results <- cross_df %>%
+    select(Cross, Parent1, Parent2, Family1, Family2, Cross_Type) %>%
+    left_join(pred_df, by = c("Parent1", "Parent2")) %>%
+    mutate(
+      Trait = tr,
+      Cross = Cross.x
+    ) %>%
+    select(
+      Trait, Cross, Parent1, Parent2, Family1, Family2, Cross_Type,
+      Predicted_Cross_Mean, Parent1_GEBV, Parent2_GEBV,
+      MidParent_GEBV, Approx_Cross_SD, Approx_Cross_Var,
+      Usefulness_Criterion
+    ) %>%
+    arrange(desc(Usefulness_Criterion), desc(Predicted_Cross_Mean))
+  
+  write.csv(
+    trait_cross_results,
+    file.path(outdir, paste0("predicted_cross_performance_", tr, ".csv")),
+    row.names = FALSE
+  )
+  
+  # Top 20 by usefulness criterion
+  top_trait <- trait_cross_results %>%
+    slice_max(order_by = Usefulness_Criterion, n = 20, with_ties = FALSE)
+  
+  write.csv(
+    top_trait,
+    file.path(outdir, paste0("top20_crosses_", tr, ".csv")),
+    row.names = FALSE
+  )
+  
+  # T65 crosses only
+  t65_trait <- trait_cross_results %>%
+    filter(Parent1 == "T65" | Parent2 == "T65") %>%
+    arrange(desc(Usefulness_Criterion), desc(Predicted_Cross_Mean))
+  
+  write.csv(
+    t65_trait,
+    file.path(outdir, paste0("T65_crosses_", tr, ".csv")),
+    row.names = FALSE
+  )
+  
+  # Quick top-cross plot
+  p <- trait_cross_results %>%
+    slice_max(order_by = Usefulness_Criterion, n = 15, with_ties = FALSE) %>%
+    mutate(Cross = factor(Cross, levels = rev(Cross))) %>%
+    ggplot(aes(x = Cross, y = Usefulness_Criterion)) +
+    geom_col() +
+    coord_flip() +
+    theme_classic() +
+    labs(
+      title = paste("Top predicted crosses for", tr),
+      x = NULL,
+      y = "Usefulness criterion"
+    )
+  
+  ggsave(
+    filename = file.path(outdir, paste0("Top15_crosses_", tr, ".png")),
+    plot = p,
+    width = 5.5,
+    height = 4.0,
+    units = "in",
+    dpi = 300
+  )
+  
+  all_trait_results[[tr]] <- trait_cross_results
+}
+
+############################################################
+# Combine all traits
+############################################################
+combined_results <- bind_rows(all_trait_results)
+
+write.csv(
+  combined_results,
+  file.path(outdir, "predicted_cross_performance_all_traits.csv"),
+  row.names = FALSE
+)
+
+############################################################
+# Across-trait summary
+############################################################
+summary_across_traits <- combined_results %>%
+  group_by(Cross, Parent1, Parent2, Family1, Family2, Cross_Type) %>%
+  summarise(
+    Mean_Predicted_Cross_Mean = mean(Predicted_Cross_Mean, na.rm = TRUE),
+    Mean_Approx_Cross_SD = mean(Approx_Cross_SD, na.rm = TRUE),
+    Mean_UC = mean(Usefulness_Criterion, na.rm = TRUE),
+    Traits_Evaluated = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Mean_UC), desc(Mean_Predicted_Cross_Mean))
+
+write.csv(
+  summary_across_traits,
+  file.path(outdir, "cross_ranking_summary_across_traits.csv"),
+  row.names = FALSE
+)
+
+############################################################
+# T65 summary across traits
+############################################################
+t65_summary <- combined_results %>%
+  filter(Parent1 == "T65" | Parent2 == "T65") %>%
+  group_by(Cross, Parent1, Parent2, Family1, Family2, Cross_Type) %>%
+  summarise(
+    Mean_Predicted_Cross_Mean = mean(Predicted_Cross_Mean, na.rm = TRUE),
+    Mean_Approx_Cross_SD = mean(Approx_Cross_SD, na.rm = TRUE),
+    Mean_UC = mean(Usefulness_Criterion, na.rm = TRUE),
+    Traits_Evaluated = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Mean_UC), desc(Mean_Predicted_Cross_Mean))
+
+write.csv(
+  t65_summary,
+  file.path(outdir, "T65_cross_ranking_summary_across_traits.csv"),
+  row.names = FALSE
+)
+############################################################
+# Plot
+############################################################
+library(ggplot2)
+library(dplyr)
+
+#results <- read.csv(file.path(outdir, "cross_performance_all_traits.csv"))
+files <- list.files(outdir, pattern = "all_traits.csv", full.names = TRUE)
+results <- read.csv(files[1])
+
+top_n <- 10
+
+top_crosses <- results %>%
+  group_by(Trait) %>%
+  slice_max(order_by = Usefulness_Criterion, n = top_n) %>%
+  ungroup()
+
+p1 <- ggplot(top_crosses,
+             aes(x = reorder(Cross, Usefulness_Criterion),
+                 y = Usefulness_Criterion)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~Trait, scales = "free_y") +
+  labs(
+    title = "Top Predicted Crosses per Trait (Usefulness Criterion)",
+    x = "Cross",
+    y = "Usefulness Criterion"
+  ) +
+  theme_classic() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 7),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(outdir, "Top_Crosses_per_Trait.png"),
+       p1, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(outdir, "Top_Crosses_per_Trait.pdf"),
+       p1, width = 6, height = 4)
+
+p2 <- ggplot(results,
+             aes(x = Predicted_Cross_Mean,
+                 y = Approx_Cross_SD)) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~Trait, scales = "free") +
+  labs(
+    title = "Cross Mean vs Genetic Variance",
+    x = "Predicted Mean",
+    y = "Within-Cross SD"
+  ) +
+  theme_classic() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(outdir, "Cross_Mean_vs_SD.png"),
+       p2, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(outdir, "Cross_Mean_vs_SD.pdf"),
+       p2, width = 6, height = 4)
+
+p3 <- ggplot(results,
+             aes(x = MidParent_GEBV,
+                 y = Predicted_Cross_Mean)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.5) +
+  facet_wrap(~Trait, scales = "free") +
+  labs(
+    title = "Mid-parent vs Predicted Cross Mean",
+    x = "Mid-parent GEBV",
+    y = "Predicted Cross Mean"
+  ) +
+  theme_classic()
+
+ggsave(file.path(outdir, "Midparent_vs_CrossMean.png"),
+       p3, width = 6, height = 4, dpi = 300)
+
+ggsave(file.path(outdir, "Midparent_vs_CrossMean.pdf"),
+       p3, width = 6, height = 4)
+
+results <- results %>%
+  mutate(T65_cross = ifelse(grepl("T65", Cross), "T65 crosses", "Other"))
+
+p4 <- ggplot(results,
+             aes(x = Predicted_Cross_Mean,
+                 fill = T65_cross)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~Trait, scales = "free") +
+  theme_classic() +
+  labs(
+    title = "Distribution of Cross Performance",
+    x = "Predicted Cross Mean"
+  )
+
+ggsave(file.path(outdir, "T65_vs_Other_Crosses.png"),
+       p4, width = 6, height = 4, dpi = 300)
+############################################################
+# Save session info
+############################################################
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(outdir, "sessionInfo.txt")
+)
+
+log_message("Done. Results written to: ", outdir)
+
+#############################
+############################
+library(ggplot2)
+library(dplyr)
+
+outdir <- "cross_performance_rrBLUP_2018_56k"
+
+results <- read.csv(file.path(outdir, "predicted_cross_performance_all_traits.csv"))
+
+# Requested trait order
+trait_order <- c(
+  "DTH", "CL", "PL", "PRL",
+  "PN", "PW", "SW", "NPB",
+  "NSPP", "BM", "SSR"
+)
+
+results_rel <- results %>%
+  mutate(Trait = factor(Trait, levels = trait_order)) %>%
+  group_by(Trait) %>%
+  mutate(
+    UC_rel = Usefulness_Criterion - mean(Usefulness_Criterion, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+top_rel <- results_rel %>%
+  group_by(Trait) %>%
+  slice_max(order_by = UC_rel, n = 15, with_ties = FALSE) %>%
+  ungroup()
+
+# Order crosses within each trait separately
+top_rel <- top_rel %>%
+  arrange(Trait, UC_rel) %>%
+  mutate(Cross_trait = paste(Cross, Trait, sep = "___"))
+
+p_rel <- ggplot(
+  top_rel,
+  aes(x = reorder(Cross_trait, UC_rel), y = UC_rel)
+) +
+  geom_col(width = 0.72) +
+  coord_flip() +
+  facet_wrap(~Trait, scales = "free_y", ncol = 4) +
+  scale_x_discrete(
+    labels = function(x) sub("___.*$", "", x)
+  ) +
+  labs(
+    title = "Top 15 Predicted Crosses Based on Relative UC Within Each Trait",
+    x = "Cross",
+    y = "UC relative to trait mean"
+  ) +
+  theme_classic() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10, color = "black"),
+    axis.text.y = element_text(size = 5.8, color = "black"),
+    axis.text.x = element_text(size = 6.2, color = "black"),
+    axis.title.x = element_text(face = "bold", size = 8, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 8, color = "black"),
+    plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+    panel.spacing = unit(0.9, "lines"),
+    plot.margin = margin(6, 8, 6, 6)
+  )
+
+ggsave(
+  file.path(outdir, "Top_Crosses_RELATIVE_improved.png"),
+  p_rel,
+  width = 6.2,
+  height = 5.2,
+  dpi = 600
+)
+
+ggsave(
+  file.path(outdir, "Top_Crosses_RELATIVE_improved.pdf"),
+  p_rel,
+  width = 6.2,
+  height = 4.8
+)
