@@ -8,10 +8,11 @@ The study evaluate **training population sizes** and also compares **low-density
 ---
 
 ## Key Findings
-- GBS markers are sufficient for genomic prediction
-- Higher marker density improves GWAS resolution, with local GWAS refining signals
-- Across evaluated models (rrBLUP, BL, BayesB, RKHS), RKHS and Bayesian models show superior performance, with differences driven by trait genetic architecture
-- An aus-derived NAM population enables efficient genomic prediction with reduced training size  
+- Expanded aus-derived NAM population enables integrated genomic prediction and GWAS in rice
+- Prediction accuracy plateaued at moderate marker densities (~10k–20k SNPs)
+- Efficient prediction achieved using ~40–60% of the training population
+- Marker density had limited impact on prediction but substantially improved GWAS resolution
+- NAM framework links genomic prediction to cross design for improved breeding decisions 
 
 ---
 
