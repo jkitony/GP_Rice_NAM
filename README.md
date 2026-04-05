@@ -8,17 +8,17 @@ The study evaluate **training population sizes** and also compares **low-density
 ---
 
 ## Key Findings
-- GBS markers are sufficient for genomic prediction  
-- Higher marker density improves GWAS resolution  
-- Across evaluated models (**ridge regression best linear unbiased prediction (rrBLUP),Bayesian LASSO (BL), Bayesian B (BayesB) and reproducing kernel Hilbert space regression (RKHS)**),  
-  **RKHS and Bayesian models showed superior performance**  with key differences driven by genetic architecture (traits) 
-- An aus-Derived NAM Population Enables Efficient Genomic Prediction with Reduced Training Size  
+- GBS markers are sufficient for genomic prediction
+- Higher marker density improves GWAS resolution, with local GWAS refining signals
+- Across evaluated models (rrBLUP, BL, BayesB, RKHS), RKHS and Bayesian models show superior performance, with differences driven by trait genetic architecture
+- An aus-derived NAM population enables efficient genomic prediction with reduced training size  
 
 ---
 
 ## Data
 - **Phenotypes:** Eleven agronomic traits  
 - **Genotypes:** GBS SNPs (14 families) and WGS of the parental lines (7 diversity donors + T65 japonica rice common parent)
+-  Datasets available in https://doi.org/10.6084/m9.figshare.31931388
 
 
 ---
