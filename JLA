@@ -1,0 +1,93 @@
+
+rm(list = ls())
+
+# ==============================
+# Prepare TASSEL JLA phenotype files
+# ==============================
+
+pheno_file <- "semitrimmed_pheno.txt"
+target_year <- 18
+
+traits <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+
+outdir <- "JLA_inputs"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# Read phenotype file
+pheno <- read.table(pheno_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+
+# Basic checks
+required_cols <- c("Genotype", "Family", "Year")
+missing_required <- setdiff(required_cols, colnames(pheno))
+if (length(missing_required) > 0) {
+  stop("Missing required columns in phenotype file: ", paste(missing_required, collapse = ", "))
+}
+
+missing_traits <- setdiff(traits, colnames(pheno))
+if (length(missing_traits) > 0) {
+  stop("Missing trait columns in phenotype file: ", paste(missing_traits, collapse = ", "))
+}
+
+# Filter Year 18
+pheno18 <- subset(pheno, Year == target_year)
+
+if (nrow(pheno18) == 0) {
+  stop("No rows found for Year == ", target_year)
+}
+
+# Clean Family as character
+pheno18$Family <- as.character(pheno18$Family)
+pheno18$Genotype <- as.character(pheno18$Genotype)
+
+# Save metadata summary
+family_counts <- as.data.frame(table(pheno18$Family), stringsAsFactors = FALSE)
+colnames(family_counts) <- c("Family", "N_lines")
+write.table(
+  family_counts,
+  file = file.path(outdir, "Year18_family_metadata.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+# Write one phenotype file per trait
+for (tr in traits) {
+  df <- pheno18[, c("Genotype", "Family", tr)]
+  df <- df[!is.na(df[[tr]]), , drop = FALSE]
+  
+  outfile <- file.path(outdir, paste0("Year18_", tr, "_JLApheno.txt"))
+  write.table(df, file = outfile, sep = "\t", quote = FALSE, row.names = FALSE)
+}
+
+# Also write a combined multi-trait file if needed
+combined <- pheno18[, c("Genotype", "Family", traits)]
+write.table(
+  combined,
+  file = file.path(outdir, "Year18_alltraits_JLApheno.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+cat("Done.\n")
+cat("Created files in:", outdir, "\n")
+##############################################################
+##############################################################
+(base) jkitony@jkitony:/mnt/c/Rice/2026/JLA$
+
+perl /mnt/c/Rice/2026/Projections/tassel-5-standalone/run_pipeline.pl \
+  -fork1 -h Fourteen_projected_10k.hmp.txt \
+  -fork2 -r JLA_inputs/Year18_DTH_JLApheno.txt \
+  -combine3 -input1 -input2 -intersect \
+  -StepwiseOLSModelFitterPlugin \
+  -modelType pvalue \
+  -enter 0.001 \
+  -exit 0.001 \
+  -maxMarkers 100 \
+  -nestMarkers true \
+  -nestFactor Family \
+  -nperm 1000 \
+  -endPlugin \
+  -export JLA_DTH_Year18.txt \
+  -runfork1 -runfork2
+
