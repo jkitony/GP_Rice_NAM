@@ -763,3 +763,139 @@ ggsave(
 )
 
 log_message("FINAL production run done successfully")
+#########################################################################################################
+#########################################################################################################
+##NUMBERS Not %
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(grid)
+})
+
+############################################################
+# User settings
+############################################################
+outdir <- "population_size_effect_2018_trueCV5x10_final"
+infile <- file.path(outdir, "population_size_prediction_accuracy_summary_2018.csv")
+
+trait_order <- c("DTH", "CL", "PL", "PRL", "PN", "PW", "SW", "NPB", "NSPP", "BM", "SSR")
+model_order <- c("rrBLUP", "RKHS", "BayesB", "BL")
+
+############################################################
+# Read summary file
+############################################################
+summary_df <- read.csv(infile, stringsAsFactors = FALSE)
+
+############################################################
+# Prepare x-axis labels from actual mean training lines
+# Use discrete groups so labels do not overlap/scribble
+############################################################
+x_df <- summary_df %>%
+  group_by(Train_Fraction_of_Pool) %>%
+  summarise(
+    Mean_N_train = mean(Mean_N_train, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Train_Fraction_of_Pool) %>%
+  mutate(
+    x_group = factor(
+      c("G1", "G2", "G3", "G4", "G5"),
+      levels = c("G1", "G2", "G3", "G4", "G5")
+    ),
+    x_label = as.character(round(Mean_N_train, 0))
+  )
+
+plot_df <- summary_df %>%
+  left_join(
+    x_df %>% select(Train_Fraction_of_Pool, x_group),
+    by = "Train_Fraction_of_Pool"
+  ) %>%
+  mutate(
+    Trait = factor(Trait, levels = trait_order),
+    Model = factor(Model, levels = model_order),
+    x_group = factor(x_group, levels = levels(x_df$x_group))
+  ) %>%
+  arrange(Trait, Model, Train_Fraction_of_Pool)
+
+############################################################
+# Theme
+############################################################
+theme_pub <- theme_classic() +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 10, color = "black"),
+    axis.title.y = element_text(face = "bold", size = 10, color = "black"),
+    axis.text.x  = element_text(face = "plain", size = 8, color = "black"),
+    axis.text.y  = element_text(face = "plain", size = 8, color = "black"),
+    legend.title = element_text(face = "bold", size = 9, color = "black"),
+    legend.text  = element_text(face = "plain", size = 8, color = "black"),
+    legend.key.size = unit(0.32, "cm"),
+    legend.spacing.y = unit(0.02, "cm"),
+    legend.box.spacing = unit(0.03, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    plot.margin = margin(3, 3, 3, 3),
+    axis.line = element_line(linewidth = 0.4, color = "black")
+  )
+
+############################################################
+# Traitwise figure using rounded actual line numbers
+############################################################
+p_trait <- ggplot(
+  plot_df,
+  aes(x = x_group, y = Mean_Accuracy, color = Model, group = Model)
+) +
+  geom_line(linewidth = 0.35) +
+  geom_point(size = 0.8) +
+  geom_errorbar(
+    aes(ymin = Mean_Accuracy - SE_Accuracy, ymax = Mean_Accuracy + SE_Accuracy),
+    width = 0.08,
+    linewidth = 0.2
+  ) +
+  facet_wrap(~Trait, ncol = 4) +
+  scale_x_discrete(labels = x_df$x_label) +
+  labs(
+    x = "Training lines used",
+    y = "Prediction accuracy",
+    color = "Model"
+  ) +
+  theme_pub +
+  theme(
+    strip.text = element_text(face = "bold", size = 10, color = "black"),
+    strip.background = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.spacing = unit(0.6, "lines"),
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 8),
+    legend.position = c(0.98, 0.02),
+    legend.justification = c(1, 0),
+    legend.background = element_rect(fill = "white", color = NA)
+  ) +
+  guides(
+    color = guide_legend(
+      title = "Model",
+      ncol = 1,
+      byrow = TRUE,
+      override.aes = list(size = 2)
+    )
+  )
+
+############################################################
+# Save
+############################################################
+ggsave(
+  filename = file.path(outdir, "Figure_main_traitwise_population_size_effect_2018_lines.DOI.pdf"),
+  plot = p_trait,
+  width = 6.5,
+  height = 4.8,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(outdir, "Figure_main_traitwise_population_size_effect_2018_lines.DOI.png"),
+  plot = p_trait,
+  width = 6.5,
+  height = 4.8,
+  units = "in",
+  dpi = 600
+)
