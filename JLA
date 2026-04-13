@@ -91,3 +91,11 @@ perl /mnt/c/Rice/2026/Projections/tassel-5-standalone/run_pipeline.pl \
   -export JLA_DTH_Year18.txt \
   -runfork1 -runfork2
 
+#####################################################################
+#new environment
+install.packages("renv")
+renv::init()
+
+##
+install.packages("pak", repos = "https://r-lib.github.io/p/pak/dev/")
+library(pak)
