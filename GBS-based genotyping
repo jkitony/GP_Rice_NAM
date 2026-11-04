@@ -10,18 +10,18 @@
 #################################################################################################################
 name=WNAM02
 enzyme=KpnI-MspI
-seqDir=/linuxhome/kitony/gbsFeb/raw/WNAM02
-keyFile=/linuxhome/kitony/gbsFeb/raw/WNAM02/WNAM02_1_key.txt
-dbPath=/linuxhome/kitony/gbsFeb/results
-
+seqDir=/mnt/c/gbsFeb/raw/WNAM02
+keyFile=/mnt/c/RICE/gbsFeb/raw/WNAM02/WNAM02_1_key_gbsv2.txt
+dbPath=/mnt/c/gbsFeb/results
+TASSEL="$HOME/tassel-5-standalone/run_pipeline.pl"
 
 ###################################################################################################################
 #No need to edit from here unless tweaking plugin options or muting BWA index creation
 ####################################################################################################################
 #step1: gbsSeqToTagDBPlugin
-perl ~/TASSEL5/run_pipeline.pl -Xmx20g -fork1 -GBSSeqToTagDBPlugin -db ~/gbsFeb/results/${name}.db -i ~/gbsFeb/raw/${name} -k ${keyFile} -e ${enzyme} -kmerLength 64 -minKmerL 0 -mnQS 20 -mxKmerNum 100000000 -c 1 -endPlugin -runfork1
+perl "$TASSEL" -Xmx20g -fork1 -GBSSeqToTagDBPlugin -db /mnt/c/RICE/gbsFeb/results/${name}.db -i /mnt/c/RICE/gbsFeb/raw/${name} -k ${keyFile} -e ${enzyme} -kmerLength 64 -minKmerL 0 -mnQS 20 -mxKmerNum 100000000 -c 1 -endPlugin -runfork1
 #step2: TagExportToFastqPlugin
-perl ~/TASSEL5/run_pipeline.pl -Xmx20g -fork1 -TagExportToFastqPlugin -db ~/gbsFeb/results/${name}.db -o ~/gbsFeb/results/${name}_1_fastq.txt.gz -c 1 -endPlugin -runfork1
+perl "$TASSEL" -Xmx20g -fork1 -TagExportToFastqPlugin -db /mnt/c/RICE/gbsFeb/results/${name}.db -o /mnt/c/RICE/gbsFeb/results/${name}_1_fastq.txt.gz -c 1 -endPlugin -runfork1
 ########################################################################################################################
 #step3: BWA Alignment. Create reference index just once
 #########################################################################################################################
