@@ -1,9 +1,9 @@
 #Install and Export BWA,TASSEL and VCF tools to path
 #create superdirectory gbsFeb then four sub-directories reference, scripts,results/${name} and raw
-#Store fastq files(/WNAM39/WNAM39_1_fastq.txt.gz)and key files(/WNAM39/WNAM39_1_key.txt,/WNAM39/WNAM39_Pedigree.txt)
+#Store fastq files(/WNAM02/WNAM02_1_fastq.txt.gz)and key files(/WNAM02/WNAM02_1_key.txt,/WNAM02/WNAM02_Pedigree.txt)
 #Rename this script with population name  that you want to analyze e.g WNAM39.sh and save in script sub-folder
-#cd the script directory then make script executable >>> chmod +x WNAM39.sh
-#run the script >>>./WNAM39.sh
+#cd the script directory then make script executable >>> chmod +x WNAM02.sh
+#run the script >>>./WNAM02.sh
 
 #################################################################################################################
 #Declare variables
