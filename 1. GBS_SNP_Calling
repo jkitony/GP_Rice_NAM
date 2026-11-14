@@ -1,0 +1,529 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# GBS SNP discovery, parental filtering and imputation
+#
+# Example family: WNAM40
+#
+# Workflow:
+#   Merge R1 lane files -> trim adapters -> discover/call SNPs ->
+#   rename samples -> retain parent-informative SNPs ->
+#   filter MAF/missingness/spacing -> impute each chromosome -> merge outputs.
+#
+# Required tools:
+#   Bash, Perl, Java, Cutadapt, BWA, VCFtools, awk and TASSEL 4/5.
+#   Use Java versions compatible with the installed TASSEL releases.
+#
+# Required input files:
+#   1. FASTQ files.
+#   2. TASSEL GBSv2 barcode key file.
+#   3. Reference genome in FASTA format.
+#   4. FSFHap pedigree file with sample names matching the renamed HapMap.
+# This script ends with imputed GBS genotypes. Projection of parental WGS
+# variants and generation of marker-density panels are separate steps.
+###############################################################################
+
+
+###############################################################################
+# 1. Define family-specific settings
+#
+# Use absolute paths for the input files and TASSEL installations.
+# Use a NEW output directory for each run to avoid reusing a populated database.
+###############################################################################
+
+POPULATION="WNAM40"
+
+R1_LANE1="L6_NAM40_combined_R1.fastq.gz"
+R1_LANE2="L7_NAM40_combined_R1.fastq.gz"
+
+KEYFILE="WNAM40_key.txt"
+REFERENCE="reference.fa"
+PEDIGREE="WNAM_merged_pedigree40.txt"
+
+TASSEL5="$HOME/tassel-5-standalone/run_pipeline.pl"
+TASSEL4="/mnt/c/RICE/MS_rev1/tassel-tassel4-standalone/run_pipeline.pl"
+
+OUTDIR="WNAM40_run01"
+
+PARENT1="T65"
+PARENT2="WRC"
+
+ENZYME="KpnI-MspI"
+ADAPTER="AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"
+
+THREADS=8
+JAVA_HEAP="20g"
+
+# SNP-discovery parameters.
+MIN_LOCUS_COVERAGE=0.3
+DISCOVERY_MAF=0.05
+
+# Post-calling filters.
+FILTER_MAF=0.02
+MIN_NONMISSING=0.5
+MIN_SNP_DISTANCE=64
+
+# Rice chromosomes.
+CHROMOSOMES=({1..12})
+
+# Short functions avoid repeating the TASSEL paths and Java memory setting.
+t5() {
+    perl "$TASSEL5" "-Xmx${JAVA_HEAP}" "$@"
+}
+
+t4() {
+    perl "$TASSEL4" "-Xmx${JAVA_HEAP}" "$@"
+}
+
+
+###############################################################################
+# 2. Check inputs and create the working directory
+###############################################################################
+
+for tool in perl java cutadapt bwa vcftools awk; do
+    command -v "$tool" >/dev/null || {
+        echo "Required tool not found: $tool" >&2
+        exit 1
+    }
+done
+
+for file in \
+    "$R1_LANE1" "$R1_LANE2" "$KEYFILE" "$REFERENCE" \
+    "$PEDIGREE" "$TASSEL5" "$TASSEL4"
+do
+    [[ -s "$file" ]] || {
+        echo "Input file missing or empty: $file" >&2
+        exit 1
+    }
+done
+
+[[ ! -e "$OUTDIR" ]] || {
+    echo "Output directory already exists: $OUTDIR" >&2
+    exit 1
+}
+
+mkdir -p "$OUTDIR"/{trimmed_reads,chromosomes}
+cd "$OUTDIR"
+
+# Save terminal output and commands in a log.
+exec > >(tee pipeline.log) 2>&1
+set -x
+
+
+###############################################################################
+# 3. Merge R1 reads sequenced across two lanes
+#
+# Concatenating gzip files produces a valid multi-member gzip file.
+#
+# IMPORTANT:
+# Merge only when both lanes have compatible barcode-to-sample mappings.
+# If a barcode identifies different samples across lanes, keep lane files
+# separate and use the appropriate TASSEL key-file entries.
+#
+# This example uses R1 only; it does not combine R1 and R2 reads.
+###############################################################################
+
+cat "$R1_LANE1" "$R1_LANE2" > "${POPULATION}_merged_R1.fastq.gz"
+
+
+###############################################################################
+# 4. Remove adapters
+#
+# Retain reads at least 20 nucleotides long after trimming.
+# Confirm that ADAPTER matches the sequencing-library preparation.
+#
+# Only trimmed reads are placed in the TASSEL input directory. This prevents
+# TASSEL from processing both raw and trimmed copies of the same reads.
+#
+# The trimmed filename and flowcell/lane metadata in KEYFILE must follow the
+# conventions required by the installed TASSEL GBSv2 release.
+###############################################################################
+mkdir trimmed_reads
+cutadapt \
+    -a "$ADAPTER" \
+    --minimum-length 20 \
+    -j "$THREADS" \
+    -o "trimmed_reads/${POPULATION}_1_fastq.gz" \
+    "${POPULATION}_merged_R1.fastq.gz"
+
+
+###############################################################################
+# 5. Identify GBS tags and store them in a SQLite database
+#
+# KEYFILE must be a tab-delimited TASSEL GBSv2 barcode key containing the
+# correct sample names, barcodes and sequencing metadata.
+#
+# Retained settings:
+#   Maximum tag length: 64
+#   Minimum tag length: 20
+#   Minimum quality setting: 20
+#   Minimum tag count: 1
+###############################################################################
+
+t5 -fork1 \
+    -GBSSeqToTagDBPlugin \
+    -db "${POPULATION}.db" \
+    -i trimmed_reads \
+    -k "$KEYFILE" \
+    -e "$ENZYME" \
+    -kmerLength 64 \
+    -minKmerL 20 \
+    -mnQS 20 \
+    -mxKmerNum 100000000 \
+    -c 1 \
+    -endPlugin \
+    -runfork1
+
+
+###############################################################################
+# 6. Export tags and align them to the reference genome
+#
+# TagExportToFastqPlugin exports FASTQ, so the output uses a .fastq.gz suffix.
+#
+# Index a local reference copy to avoid changing the original reference.
+# Record the exact reference assembly release and checksum.
+###############################################################################
+
+t5 -fork1 \
+    -TagExportToFastqPlugin \
+    -db "${POPULATION}.db" \
+    -o "${POPULATION}.tags.fastq.gz" \
+    -c 1 \
+    -endPlugin \
+    -runfork1
+
+cp "$REFERENCE" reference.fa
+bwa index reference.fa
+
+bwa aln \
+    -t "$THREADS" \
+    reference.fa \
+    "${POPULATION}.tags.fastq.gz" \
+    > "${POPULATION}.sai"
+
+bwa samse \
+    reference.fa \
+    "${POPULATION}.sai" \
+    "${POPULATION}.tags.fastq.gz" \
+    > "${POPULATION}.sam"
+
+
+###############################################################################
+# 7. Import tag alignments and discover SNPs
+#
+# Discovery MAF and post-calling filters.
+###############################################################################
+
+t5 -fork1 \
+    -SAMToGBSdbPlugin \
+    -i "${POPULATION}.sam" \
+    -db "${POPULATION}.db" \
+    -aProp 0.0 \
+    -aLen 0 \
+    -endPlugin \
+    -runfork1
+
+t5 -fork1 \
+    -DiscoverySNPCallerPluginV2 \
+    -db "${POPULATION}.db" \
+    -mnLCov "$MIN_LOCUS_COVERAGE" \
+    -mnMAF "$DISCOVERY_MAF" \
+    -endPlugin \
+    -runfork1
+
+
+###############################################################################
+# 8. Call genotypes and export VCF, HDF5 and HapMap
+#
+# Both production calls use the same database and trimmed reads.
+###############################################################################
+
+for format in vcf h5; do
+    t5 -fork1 \
+        -ProductionSNPCallerPluginV2 \
+        -db "${POPULATION}.db" \
+        -e "$ENZYME" \
+        -i trimmed_reads \
+        -k "$KEYFILE" \
+        -kmerLength 64 \
+        -mnQS 20 \
+        -o "${POPULATION}.${format}" \
+        -endPlugin \
+        -runfork1
+done
+
+t5 \
+    -h5 "${POPULATION}.h5" \
+    -export "${POPULATION}.raw.hmp.txt" \
+    -exportType Hapmap
+
+
+###############################################################################
+# 9. Standardize HapMap sample names
+#
+# HapMap contains 11 metadata columns; sample columns begin at column 12.
+#
+# WNAM40-specific changes:
+#   Nepal _55  -> WRC
+#   NAM_40_052 -> WNAM_40052
+#   NAM_40_001 -> WNAM_40001
+#   T65        -> T65 (unchanged)
+#
+# Update these rules for other families.
+# Only HapMap names are changed; VCF and HDF5 names remain unchanged.
+# PEDIGREE must use the renamed HapMap sample names.
+###############################################################################
+
+awk '
+BEGIN { FS = OFS = "\t" }
+
+NR == 1 {
+    for (i = 12; i <= NF; i++) {
+        if ($i == "Nepal _55")
+            $i = "WRC"
+        else if ($i ~ /^NAM_40_[0-9][0-9][0-9]$/)
+            sub(/^NAM_40_/, "WNAM_40", $i)
+    }
+}
+
+{ print }
+' "${POPULATION}.raw.hmp.txt" > "${POPULATION}.hmp.txt"
+
+# Require both parents and unique sample names after renaming.
+awk -v p1="$PARENT1" -v p2="$PARENT2" '
+BEGIN { FS = "\t" }
+NR == 1 {
+    for (i = 12; i <= NF; i++) {
+        if (seen[$i]++) {
+            print "Duplicate sample name: " $i > "/dev/stderr"
+            exit 1
+        }
+        if ($i == p1) found1 = 1
+        if ($i == p2) found2 = 1
+    }
+    if (!found1 || !found2) {
+        print "One or both parents are missing" > "/dev/stderr"
+        exit 1
+    }
+    exit
+}
+' "${POPULATION}.hmp.txt"
+
+#No. of raw SNPs
+###############################################################################
+# 10. Identify parent-informative sites using TASSEL 4
+#
+# Retain the original filtering approach:
+#   a. Export each parent separately.
+#   b. Identify single-base A/C/G/T allele annotations in each parent.
+#   c. Identify sites monomorphic in the combined-parent export.
+#   d. Retain sites shared by the single-parent lists and exclude sites
+#      monomorphic between parents.
+#
+# This intends to retain homozygous, contrasting parental calls.
+# Confirm that the installed TASSEL 4 release recalculates allele annotations
+# after selecting parents. 
+###############################################################################
+
+for parent in "$PARENT1" "$PARENT2"; do
+
+    t4 -fork1 \
+        -h "${POPULATION}.hmp.txt" \
+        -fork2 -includeTaxa "$parent" -input1 \
+        -export "${POPULATION}.${parent}.hmp.txt" \
+        -runfork1 -runfork2
+
+    awk -F '\t' '
+        NR > 1 && $2 ~ /^[ACGT]$/ { print $1 }
+    ' "${POPULATION}.${parent}.hmp.txt" \
+        > "${POPULATION}.${parent}.homozygous_sites.txt"
+
+done
+
+t4 -fork1 \
+    -h "${POPULATION}.hmp.txt" \
+    -fork2 -includeTaxa "${PARENT1},${PARENT2}" -input1 \
+    -export "${POPULATION}.parents.hmp.txt" \
+    -runfork1 -runfork2
+
+awk -F '\t' '
+    NR > 1 && $2 ~ /^[ACGT]$/ { print $1 }
+' "${POPULATION}.parents.hmp.txt" \
+    > "${POPULATION}.parents.monomorphic_sites.txt"
+
+t4 -fork1 \
+    -h "${POPULATION}.hmp.txt" \
+    -fork2 \
+        -includeSiteNamesInFile \
+        "${POPULATION}.${PARENT1}.homozygous_sites.txt" \
+        -input1 \
+    -fork3 \
+        -includeSiteNamesInFile \
+        "${POPULATION}.${PARENT2}.homozygous_sites.txt" \
+        -input2 \
+    -fork4 \
+        -excludeSiteNamesInFile \
+        "${POPULATION}.parents.monomorphic_sites.txt" \
+        -input3 \
+    -export "filt_informsites_${POPULATION}.hmp.txt" \
+    -runfork1 -runfork2 -runfork3 -runfork4
+
+
+###############################################################################
+# 11. Filter SNPs by MAF, missingness and physical spacing
+#
+# Retain the original analysis order:
+#   Filter/thin the full production VCF, then intersect with parental sites.
+# Changing this order can change the retained marker set.
+#
+# --max-missing 0.5 means at least 50% of genotypes must be nonmissing.
+# These statistics use all samples present in the VCF.
+#
+# No sample-level filtering or explicit genotype-depth filter is applied here.
+###############################################################################
+
+vcftools \
+    --vcf "${POPULATION}.vcf" \
+    --maf "$FILTER_MAF" \
+    --max-missing "$MIN_NONMISSING" \
+    --thin "$MIN_SNP_DISTANCE" \
+    --recode \
+    --recode-INFO-all \
+    --out "${POPULATION}.qc"
+
+# Extract marker IDs from data records, regardless of VCF header length.
+# This requires nonmissing marker IDs shared with the HapMap export.
+awk -F '\t' '
+!/^#/ {
+    if ($3 == "." || $3 == "") {
+        print "Missing VCF marker ID" > "/dev/stderr"
+        exit 1
+    }
+    print $3
+}
+' "${POPULATION}.qc.recode.vcf" > "${POPULATION}.qc.sites.txt"
+
+FILTERED="filt_informsites_maf_maxmiss_thin64_${POPULATION}.hmp.txt"
+
+# The parental filters have already been applied, so only the QC intersection
+# is needed here.
+t4 -fork1 \
+    -h "filt_informsites_${POPULATION}.hmp.txt" \
+    -fork2 \
+        -includeSiteNamesInFile "${POPULATION}.qc.sites.txt" \
+        -input1 \
+    -export "$FILTERED" \
+    -runfork1 -runfork2
+
+
+###############################################################################
+# 12. Separate the filtered HapMap into chromosomes
+#
+# This assumes TASSEL exports chromosomes as 1.hmp.txt ... 12.hmp.txt.
+# Adjust the filenames if the reference uses different chromosome labels.
+###############################################################################
+
+t5 -fork1 \
+    -h "$FILTERED" \
+    -separate \
+    -export chromosomes/ \
+    -runfork1
+
+
+###############################################################################
+# 13. Impute each chromosome independently using FSFHap
+#
+# PEDIGREE must describe the correct family and match the HapMap sample names.
+# Use the pedigree format required by the installed TASSEL version.
+#
+# Logical pedigree fields:
+#   family, taxon, parent1, parent2,
+#   parent1Contribution, parent2Contribution, F
+#
+# F is the inbreeding coefficient.
+###############################################################################
+
+for chr in "${CHROMOSOMES[@]}"; do
+
+    [[ -s "chromosomes/${chr}.hmp.txt" ]] || {
+        echo "Missing chromosome input: ${chr}" >&2
+        exit 1
+    }
+
+    t5 -fork1 \
+        -h "chromosomes/${chr}.hmp.txt" \
+        -FSFHapImputationPlugin \
+        -pedigrees "$PEDIGREE" \
+        -windowLD true \
+        -bc false \
+        -window 30 \
+        -overlap 15 \
+        -fillgaps true \
+        -outParents true \
+        -endPlugin \
+        -export "chromosomes/${chr}_FSFed" \
+        -runfork1
+
+done
+
+
+###############################################################################
+# 14. Merge chromosome outputs
+#
+# Generate repeated fork/input arguments with a loop.
+#
+# The supplied workflow assumes:
+#   *_FSFed1.hmp.txt = parent/phase output
+#   *_FSFed2.hmp.txt = imputed study output
+###############################################################################
+
+merge_chromosomes() {
+
+    local suffix="$1"
+    local output="$2"
+    local chr
+
+    local -a arguments=()
+    local -a run_arguments=()
+
+    for chr in "${CHROMOSOMES[@]}"; do
+
+        local file="chromosomes/${chr}_FSFed${suffix}.hmp.txt"
+
+        [[ -s "$file" ]] || {
+            echo "Expected FSFHap output missing: $file" >&2
+            exit 1
+        }
+
+        arguments+=("-fork${chr}" -h "$file")
+        run_arguments+=("-runfork${chr}")
+
+    done
+
+    arguments+=(-combine13)
+
+    for chr in "${CHROMOSOMES[@]}"; do
+        arguments+=("-input${chr}")
+    done
+
+    t5 "${arguments[@]}" \
+        -mergeGenotypeTables \
+        -export "$output" \
+        "${run_arguments[@]}"
+
+}
+
+merge_chromosomes 1 "${POPULATION}_parents.hmp.txt"
+merge_chromosomes 2 "${POPULATION}_study.hmp.txt"
+
+
+###############################################################################
+# Final outputs:
+#   ${POPULATION}_parents.hmp.txt
+#   ${POPULATION}_study.hmp.txt
+# This refactored script.
+###############################################################################
+
+set +x
+echo "Completed: ${POPULATION}"
