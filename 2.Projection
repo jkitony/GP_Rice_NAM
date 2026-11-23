@@ -1,0 +1,421 @@
+'''
+python3 project_nam.py \
+    --family WNAM40 \
+    --study WNAM40_study.hmp.txt \
+    --founders WNAM40_parents.hmp.txt \
+    --study-parent-a T65 \
+    --study-parent-b WRC \
+    --founder-parent-a T65 \
+    --founder-parent-b WRC40 \
+    --min-nonmissing 0.5 \
+    --target-min-distance 10 \
+    --output-dir WNAM40_projection
+
+'''
+#project_nam.py 
+#!/usr/bin/env python3
+"""
+Project parental WGS variants using imputed GBS anchors.
+
+Example:
+    python3 project_nam.py \
+        --family WNAM02 \
+        --study WNAM02_study.hmp.txt \
+        --founders WNAM02_WGS_parents.hmp.txt \
+        --study-parent-a T65 \
+        --study-parent-b WRC \
+        --founder-parent-a T65 \
+        --founder-parent-b WRC02 \
+        --output-dir WNAM02_projection
+
+Required software:
+    Python 3. No additional Python packages are required.
+
+Required inputs:
+    1. Imputed GBS HapMap containing RILs and both parents.
+    2. Dense parental WGS HapMap containing both parents.
+
+Input requirements:
+    - Both files must use the same reference assembly and coordinates.
+    - HapMap must contain 11 metadata columns followed by sample columns.
+    - Genotypes must use single-character nucleotide/IUPAC codes.
+    - Parent sample names must match the names supplied below.
+    - One marker per chromosome-position is required in each input.
+    - All study samples other than the two parents are treated as RILs.
+
+Method:
+    1. Convert each GBS anchor call to parental state:
+           A = homozygous call matching parent A
+           B = homozygous call matching parent B
+           N = missing, heterozygous or otherwise unresolved
+    2. Retain parental WGS sites with homozygous A/C/G/T calls in both parents.
+    3. Optionally thin those target positions.
+    4. Project A or B when the immediately flanking GBS anchors agree.
+       Do not extrapolate beyond the outermost anchors.
+    5. Convert projected parental states to the nucleotide alleles at each
+       WGS target position.
+    6. Retain sites with a nonmissing fraction strictly greater than the
+       specified threshold.
+    7. Restore original imputed GBS calls at retained anchor positions.
+
+Outputs:
+    FAMILY.projected_states.tsv
+        Parent-coded matrix before missingness filtering.
+
+    FAMILY.projected.hmp.txt
+        Filtered nucleotide HapMap, including retained GBS anchors.
+
+    FAMILY.projection_summary.tsv
+        Per-chromosome counts and missingness.
+
+Important:
+    This script performs projection, not additional imputation.
+    Missingness here is post-GBS-imputation/projection missingness.
+"""
+
+import argparse
+import bisect
+import csv
+from collections import defaultdict
+from pathlib import Path
+
+
+BASES = set("ACGT")
+VALID_CALLS = set("ACGTRYSWKM")
+MISSING = {"", "N", "NN", "NA", "-", "--", "?", ".", "./.", ".|."}
+
+HAPMAP_HEADER = [
+    "rs#", "alleles", "chrom", "pos", "strand",
+    "assembly#", "center", "protLSID", "assayLSID",
+    "panelLSID", "QCcode",
+]
+
+
+def genotype(value):
+    """Normalize missing calls and reject unsupported genotype encodings."""
+    value = value.strip().upper()
+
+    if value in MISSING:
+        return "N"
+
+    if value not in VALID_CALLS:
+        raise ValueError(f"Unsupported genotype encoding: {value!r}")
+
+    return value
+
+
+def chromosome(value):
+    """Normalize 01, 1 and Chr1 to the same chromosome label."""
+    value = value.strip()
+
+    if value.lower().startswith("chr"):
+        value = value[3:]
+
+    return str(int(value)) if value.isdigit() else value
+
+
+def chromosome_order(value):
+    return (0, int(value)) if value.isdigit() else (1, value)
+
+
+def read_hapmap(path):
+    """Read HapMap without modifying sample names or marker identifiers."""
+    records = defaultdict(dict)
+
+    with open(path, newline="") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        header = next(reader)
+
+        if len(header) < 12:
+            raise ValueError(f"{path}: invalid HapMap header")
+
+        samples = header[11:]
+
+        if len(samples) != len(set(samples)):
+            raise ValueError(f"{path}: duplicate sample names")
+
+        for line_number, row in enumerate(reader, start=2):
+            if not row:
+                continue
+
+            if len(row) != len(header):
+                raise ValueError(
+                    f"{path}, line {line_number}: inconsistent column count"
+                )
+
+            chrom = chromosome(row[2])
+            position = int(row[3])
+
+            if position < 1:
+                raise ValueError(f"{path}: invalid position {position}")
+
+            if position in records[chrom]:
+                raise ValueError(
+                    f"{path}: multiple markers at {chrom}:{position}"
+                )
+
+            records[chrom][position] = {
+                "metadata": row[:11],
+                "calls": [genotype(value) for value in row[11:]],
+            }
+
+    return samples, records
+
+
+def sample_index(samples, name, path):
+    if name not in samples:
+        raise ValueError(f"{path}: parent sample {name!r} not found")
+    return samples.index(name)
+
+
+def parental_states(record, parent_a, parent_b, ril_indices):
+    """Encode only homozygous, contrasting parental anchor alleles."""
+    calls = record["calls"]
+    allele_a = calls[parent_a]
+    allele_b = calls[parent_b]
+
+    informative = (
+        allele_a in BASES
+        and allele_b in BASES
+        and allele_a != allele_b
+    )
+
+    if not informative:
+        return ["N"] * len(ril_indices)
+
+    return [
+        "A" if calls[index] == allele_a
+        else "B" if calls[index] == allele_b
+        else "N"
+        for index in ril_indices
+    ]
+
+
+def project_states(position, anchor_positions, anchor_states, n_rils):
+    """Use the immediate bounding anchors; never skip unresolved anchors."""
+    index = bisect.bisect_left(anchor_positions, position)
+
+    # An exact GBS anchor retains its parent-coded state.
+    if (
+        index < len(anchor_positions)
+        and anchor_positions[index] == position
+    ):
+        return anchor_states[index]
+
+    # No projection outside the observed anchor range.
+    if index == 0 or index == len(anchor_positions):
+        return ["N"] * n_rils
+
+    left = anchor_states[index - 1]
+    right = anchor_states[index]
+
+    return [
+        a if a == b and a in {"A", "B"} else "N"
+        for a, b in zip(left, right)
+    ]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--family", required=True)
+    parser.add_argument("--study", required=True)
+    parser.add_argument("--founders", required=True)
+
+    parser.add_argument("--study-parent-a", default="T65")
+    parser.add_argument("--study-parent-b", default="WRC")
+    parser.add_argument("--founder-parent-a", default="T65")
+    parser.add_argument("--founder-parent-b", required=True)
+
+    parser.add_argument("--output-dir", required=True)
+
+    # Matches the original R condition: nonmissing fraction > 0.5.
+    parser.add_argument("--min-nonmissing", type=float, default=0.5)
+
+    # Set to 0 to retain all eligible parental WGS targets.
+    parser.add_argument("--target-min-distance", type=int, default=10)
+
+    args = parser.parse_args()
+
+    if not 0 <= args.min_nonmissing < 1:
+        parser.error("--min-nonmissing must be >= 0 and < 1")
+
+    if args.target_min_distance < 0:
+        parser.error("--target-min-distance must be >= 0")
+
+    if args.study_parent_a == args.study_parent_b:
+        parser.error("Study parent names must differ")
+
+    if args.founder_parent_a == args.founder_parent_b:
+        parser.error("Founder parent names must differ")
+
+    study_samples, study = read_hapmap(args.study)
+    founder_samples, founders = read_hapmap(args.founders)
+
+    study_a = sample_index(
+        study_samples, args.study_parent_a, args.study
+    )
+    study_b = sample_index(
+        study_samples, args.study_parent_b, args.study
+    )
+    founder_a = sample_index(
+        founder_samples, args.founder_parent_a, args.founders
+    )
+    founder_b = sample_index(
+        founder_samples, args.founder_parent_b, args.founders
+    )
+
+    ril_indices = [
+        index for index in range(len(study_samples))
+        if index not in {study_a, study_b}
+    ]
+    ril_names = [study_samples[index] for index in ril_indices]
+    n_rils = len(ril_names)
+
+    if n_rils == 0:
+        raise ValueError("No RIL samples found")
+
+    unknown_chromosomes = set(founders) - set(study)
+    if unknown_chromosomes:
+        raise ValueError(
+            "Founder chromosomes have no study anchors: "
+            + ", ".join(sorted(unknown_chromosomes))
+        )
+
+    outdir = Path(args.output_dir)
+
+    # Prevent accidental replacement of a previous projection.
+    outdir.mkdir(parents=True, exist_ok=False)
+
+    states_path = outdir / f"{args.family}.projected_states.tsv"
+    hapmap_path = outdir / f"{args.family}.projected.hmp.txt"
+    summary_path = outdir / f"{args.family}.projection_summary.tsv"
+
+    with (
+        states_path.open("w", newline="") as states_handle,
+        hapmap_path.open("w", newline="") as hapmap_handle,
+        summary_path.open("w", newline="") as summary_handle,
+    ):
+        states_writer = csv.writer(states_handle, delimiter="\t")
+        hapmap_writer = csv.writer(hapmap_handle, delimiter="\t")
+        summary_writer = csv.writer(summary_handle, delimiter="\t")
+
+        states_writer.writerow(["Marker", "Chromosome", "Position"] + ril_names)
+        hapmap_writer.writerow(HAPMAP_HEADER + ril_names)
+
+        summary_writer.writerow([
+            "Family", "Chromosome", "RILs", "GBS_anchors",
+            "Eligible_WGS_targets", "Retained_WGS_targets_after_thinning",
+            "Candidate_positions", "Retained_positions",
+            "Missing_entries_final", "Total_entries_final",
+            "Missing_proportion_final",
+        ])
+
+        for chrom in sorted(study, key=chromosome_order):
+            anchors = study[chrom]
+            anchor_positions = sorted(anchors)
+
+            anchor_states = [
+                parental_states(
+                    anchors[position], study_a, study_b, ril_indices
+                )
+                for position in anchor_positions
+            ]
+
+            # Identify eligible targets before thinning.
+            eligible_targets = {}
+
+            for position, record in founders.get(chrom, {}).items():
+                allele_a = record["calls"][founder_a]
+                allele_b = record["calls"][founder_b]
+
+                if allele_a in BASES and allele_b in BASES:
+                    eligible_targets[position] = record
+
+            # Greedy physical thinning of eligible WGS targets.
+            targets = {}
+            previous_position = None
+
+            for position in sorted(eligible_targets):
+                if (
+                    previous_position is None
+                    or position - previous_position
+                    >= args.target_min_distance
+                ):
+                    targets[position] = eligible_targets[position]
+                    previous_position = position
+
+            # Retain a single row when a WGS target overlaps a GBS anchor.
+            positions = sorted(set(anchor_positions) | set(targets))
+
+            retained = 0
+            missing_final = 0
+
+            for position in positions:
+                states = project_states(
+                    position, anchor_positions, anchor_states, n_rils
+                )
+
+                marker = f"S{int(chrom):02d}_{position}" if chrom.isdigit() \
+                    else f"S{chrom}_{position}"
+
+                states_writer.writerow(
+                    [marker, chrom, position] + states
+                )
+
+                # Apply the original >50% observed-state criterion.
+                observed_fraction = (
+                    sum(state != "N" for state in states) / n_rils
+                )
+
+                if observed_fraction <= args.min_nonmissing:
+                    continue
+
+                if position in anchors:
+                    # Restore original imputed GBS nucleotide calls,
+                    # including heterozygous calls where present.
+                    record = anchors[position]
+                    calls = [
+                        record["calls"][index] for index in ril_indices
+                    ]
+                    metadata = list(record["metadata"])
+
+                else:
+                    record = targets[position]
+                    allele_a = record["calls"][founder_a]
+                    allele_b = record["calls"][founder_b]
+
+                    mapping = {"A": allele_a, "B": allele_b, "N": "N"}
+                    calls = [mapping[state] for state in states]
+
+                    metadata = list(record["metadata"])
+                    metadata[1] = "/".join(sorted({allele_a, allele_b}))
+
+                metadata[0] = marker
+                metadata[2] = chrom
+                metadata[3] = str(position)
+
+                hapmap_writer.writerow(metadata + calls)
+
+                retained += 1
+                missing_final += calls.count("N")
+
+            total_entries = retained * n_rils
+            missing_proportion = (
+                missing_final / total_entries if total_entries else "NA"
+            )
+
+            summary_writer.writerow([
+                args.family, chrom, n_rils, len(anchor_positions),
+                len(eligible_targets), len(targets),
+                len(positions), retained,
+                missing_final, total_entries, missing_proportion,
+            ])
+
+    print(f"RILs retained: {n_rils}")
+    print(f"Parent-coded matrix: {states_path}")
+    print(f"Projected HapMap:    {hapmap_path}")
+    print(f"Projection summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
