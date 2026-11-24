@@ -322,3 +322,15 @@ echo "Completed."
 echo "Merged HapMap: $MERGED"
 echo "Summary: $OUTDIR/merge_summary.tsv"
 echo "TASSEL merge log: $OUTDIR/merge.log"
+
+################################################
+#Export the merged HapMap to VCF
+#/mnt/c/RICE/MS_rev1/GP/marker_density_results_2018/FSFHapped$
+TASSEL5="$HOME/tassel-5-standalone/run_pipeline.pl"
+
+perl "$TASSEL5" -Xmx20g \
+    -fork1 \
+    -h GBS_only_merge_complete/NAM_GBS_only_imputed.hmp.txt \
+    -export GBS_only_merge_complete/NAM_GBS_only_imputed \
+    -exportType VCF \
+    -runfork1
