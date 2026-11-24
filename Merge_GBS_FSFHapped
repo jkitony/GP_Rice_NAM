@@ -1,0 +1,324 @@
+#bash merge_GBS_only.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# Merge FSFHap-imputed GBS genotypes from 14 NAM families.
+#
+# Requirements:
+#   TASSEL 5, Java, Perl, Bash and standard Linux utilities.
+#
+# Inputs:
+#   WNAM02_study.hmp.txt ... WNAM40_study.hmp.txt
+#
+# Steps:
+#   1. Remove parental samples T65 and WRC from each family.
+#   2. Normalize TASSEL's numbered HapMap export filenames.
+#   3. Check that parental names are absent and RIL names are unique.
+#   4. Merge genotype tables across families.
+#   5. Report sample count, marker count and missingness.
+#
+# Original input files are preserved.
+#
+# Important:
+#   All inputs must use the same reference assembly and compatible marker
+#   coordinates/allele coding. Missing calls can remain at positions that
+#   occur in only some families.
+###############################################################################
+
+WORKDIR="/mnt/c/RICE/MS_rev1/GP/marker_density_results_2018/FSFHapped"
+TASSEL5="$HOME/tassel-5-standalone/run_pipeline.pl"
+
+# Use a new output directory for each run.
+OUTDIR="GBS_only_merge_complete"
+
+JAVA_HEAP="20g"
+
+# Update this list if any parent has a different sample name.
+PARENTS="T65,WRC"
+
+families=(
+    WNAM02 WNAM04 WNAM27 WNAM28 WNAM29 WNAM30 WNAM31
+    WNAM32 WNAM33 WNAM34 WNAM35 WNAM36 WNAM39 WNAM40
+)
+
+cd "$WORKDIR"
+
+###############################################################################
+# 1. Check tools and input files.
+###############################################################################
+
+for tool in perl java awk tee; do
+    command -v "$tool" >/dev/null || {
+        echo "Required tool not found: $tool" >&2
+        exit 1
+    }
+done
+
+[[ -s "$TASSEL5" ]] || {
+    echo "TASSEL launcher not found: $TASSEL5" >&2
+    exit 1
+}
+
+for family in "${families[@]}"; do
+    [[ -s "${family}_study.hmp.txt" ]] || {
+        echo "Missing input: ${family}_study.hmp.txt" >&2
+        exit 1
+    }
+done
+
+[[ ! -e "$OUTDIR" ]] || {
+    echo "Output directory already exists: $OUTDIR" >&2
+    echo "Choose a new OUTDIR before running again." >&2
+    exit 1
+}
+
+mkdir -p "$OUTDIR"
+exec > >(tee "$OUTDIR/pipeline.log") 2>&1
+
+trap 'echo "ERROR at line $LINENO. Inspect the log files." >&2' ERR
+
+###############################################################################
+# Normalize a TASSEL HapMap export.
+#
+# Depending on the output datasets, TASSEL may create:
+#   PREFIX.hmp.txt
+# or:
+#   PREFIX1.hmp.txt
+#   PREFIX2.json.gz
+#
+# Only one matching HapMap is accepted.
+###############################################################################
+
+normalize_export() {
+    local prefix="$1"
+    local expected="${prefix}.hmp.txt"
+    local -a candidates=()
+
+    if [[ -s "$expected" ]]; then
+        return
+    fi
+
+    shopt -s nullglob
+    candidates=( "${prefix}"[0-9]*.hmp.txt )
+    shopt -u nullglob
+
+    if [[ ${#candidates[@]} -ne 1 ]]; then
+        echo "Expected one HapMap export for: $prefix" >&2
+        echo "Found: ${#candidates[@]}" >&2
+        exit 1
+    fi
+
+    [[ -s "${candidates[0]}" ]] || {
+        echo "Empty HapMap export: ${candidates[0]}" >&2
+        exit 1
+    }
+
+    mv "${candidates[0]}" "$expected"
+}
+
+###############################################################################
+# 2. Remove parents from each family.
+###############################################################################
+
+ril_files=()
+
+for family in "${families[@]}"; do
+    echo "Removing parents: $family"
+
+    prefix="$OUTDIR/${family}_RILs"
+
+    perl "$TASSEL5" "-Xmx${JAVA_HEAP}" \
+        -fork1 \
+        -h "${family}_study.hmp.txt" \
+        -excludeTaxa "$PARENTS" \
+        -export "$prefix" \
+        -exportType Hapmap \
+        -runfork1 \
+        > "$OUTDIR/${family}_parent_removal.log" 2>&1
+
+    normalize_export "$prefix"
+
+    ril_files+=( "${prefix}.hmp.txt" )
+done
+
+###############################################################################
+# 3. Check parental removal and uniqueness of RIL sample names.
+# Save the expected merged sample list for verification after merging.
+###############################################################################
+
+awk -F '\t' \
+    -v parents="$PARENTS" \
+    -v sample_file="$OUTDIR/expected_RILs.txt" '
+BEGIN {
+    n = split(parents, parent_names, ",")
+    for (i = 1; i <= n; i++)
+        parent[parent_names[i]] = 1
+}
+FNR == 1 {
+    if (NF <= 11) {
+        print "No sample columns in " FILENAME > "/dev/stderr"
+        failed = 1
+    }
+
+    for (i = 12; i <= NF; i++) {
+        name = $i
+        sub(/\r$/, "", name)
+
+        if (name == "") {
+            print "Empty sample name in " FILENAME > "/dev/stderr"
+            failed = 1
+        }
+
+        if (name in parent) {
+            print "Parent remains: " name " in " FILENAME > "/dev/stderr"
+            failed = 1
+        }
+
+        if (name in seen) {
+            print "Repeated sample name: " name > "/dev/stderr"
+            failed = 1
+        }
+
+        seen[name] = 1
+        print name > sample_file
+        count++
+    }
+}
+END {
+    close(sample_file)
+    if (failed) exit 1
+    print "Total RILs expected after merging: " count
+}
+' "${ril_files[@]}"
+
+###############################################################################
+# 4. Build TASSEL arguments and merge genotype tables.
+###############################################################################
+
+arguments=()
+inputs=()
+runs=()
+
+for index in "${!ril_files[@]}"; do
+    fork=$((index + 1))
+
+    arguments+=(
+        "-fork${fork}"
+        -h "${ril_files[$index]}"
+    )
+    inputs+=("-input${fork}")
+    runs+=("-runfork${fork}")
+done
+
+combine_fork=$((${#ril_files[@]} + 1))
+merged_prefix="$OUTDIR/NAM_GBS_only_imputed"
+
+echo "Merging ${#ril_files[@]} family genotype tables"
+
+perl "$TASSEL5" "-Xmx${JAVA_HEAP}" \
+    "${arguments[@]}" \
+    "-combine${combine_fork}" \
+    "${inputs[@]}" \
+    -mergeGenotypeTables \
+    -export "$merged_prefix" \
+    -exportType Hapmap \
+    "${runs[@]}" \
+    > "$OUTDIR/merge.log" 2>&1
+
+normalize_export "$merged_prefix"
+
+MERGED="${merged_prefix}.hmp.txt"
+
+###############################################################################
+# 5. Verify that every expected RIL is present exactly once.
+###############################################################################
+
+awk -F '\t' '
+NR == FNR {
+    expected[$0] = 1
+    next
+}
+FNR == 1 {
+    for (i = 12; i <= NF; i++) {
+        name = $i
+        sub(/\r$/, "", name)
+
+        if (!(name in expected)) {
+            print "Unexpected merged sample: " name > "/dev/stderr"
+            failed = 1
+        }
+
+        if (name in observed) {
+            print "Duplicate merged sample: " name > "/dev/stderr"
+            failed = 1
+        }
+
+        observed[name] = 1
+    }
+}
+END {
+    for (name in expected) {
+        if (!(name in observed)) {
+            print "Sample missing after merging: " name > "/dev/stderr"
+            failed = 1
+        }
+    }
+
+    if (failed) exit 1
+    print "Merged sample identities verified."
+}
+' "$OUTDIR/expected_RILs.txt" "$MERGED"
+
+###############################################################################
+# 6. Report sample count, marker count and genotype missingness.
+#
+# Here, "-" is counted as missing, consistent with the SNP-only workflow.
+###############################################################################
+
+awk -F '\t' '
+NR == 1 {
+    columns = NF
+    samples = NF - 11
+    next
+}
+{
+    if (NF != columns) {
+        print "Column mismatch at line " NR > "/dev/stderr"
+        failed = 1
+        exit 1
+    }
+
+    markers++
+
+    for (i = 12; i <= NF; i++) {
+        call = toupper($i)
+        sub(/\r$/, "", call)
+        total++
+
+        if (call == "N" || call == "NN" || call == "NA" ||
+            call == "-" || call == "--" || call == "?" ||
+            call == "" || call == "." || call == "./." ||
+            call == ".|.")
+            missing++
+    }
+}
+END {
+    if (failed) exit 1
+
+    print "Metric\tValue"
+    print "RILs\t" samples
+    print "Markers\t" markers
+    printf "Total_genotype_entries\t%.0f\n", total
+    printf "Missing_genotype_entries\t%.0f\n", missing
+
+    if (total > 0)
+        printf "Missing_genotypes_percent\t%.4f\n", 100 * missing / total
+}
+' "$MERGED" | tee "$OUTDIR/merge_summary.tsv"
+
+echo
+echo "Completed."
+echo "Merged HapMap: $MERGED"
+echo "Summary: $OUTDIR/merge_summary.tsv"
+echo "TASSEL merge log: $OUTDIR/merge.log"
