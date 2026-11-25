@@ -1,0 +1,125 @@
+#(base) jkitony@jkitony:/mnt/c/RICE/MS_rev1/GP/Merging$
+python3 check_merge_missing.py \
+    WNAM02_projected2.hmp.txt \
+    Merged1790_740k_2026.hmp.txt
+########################################
+#!/usr/bin/env python3
+"""
+Check merged calls at positions absent from one family's projected HapMap.
+
+Usage:
+    python3 check_merge_missing.py \
+        WNAM02_projected2.hmp.txt \
+        Merged1790_740k_2026.hmp.txt
+
+Inputs must be nucleotide HapMaps, before downstream mean imputation.
+"""
+
+import csv
+import sys
+from collections import Counter
+
+if len(sys.argv) != 3:
+    sys.exit(
+        "Usage: python3 check_merge_missing.py "
+        "family_projected.hmp.txt merged_projected.hmp.txt"
+    )
+
+family_file, merged_file = sys.argv[1:]
+
+missing_codes = {"", "N", "NN", "NA", "-", "--", "?", "."}
+
+
+def position_key(row):
+    # Compare chromosome and position rather than relying on marker names.
+    chrom = row[2].strip()
+    if chrom.lower().startswith("chr"):
+        chrom = chrom[3:]
+    if chrom.isdigit():
+        chrom = str(int(chrom))
+    return chrom, int(row[3])
+
+
+# Read the family's marker positions and RIL names.
+family_positions = set()
+
+with open(family_file, newline="") as handle:
+    reader = csv.reader(handle, delimiter="\t")
+    header = next(reader)
+
+    # Retain NAM/WNAM RIL names; exclude parental samples.
+    ril_names = {
+        name for name in header[11:]
+        if name.upper().startswith(("NAM", "WNAM"))
+    }
+
+    for row in reader:
+        if row:
+            family_positions.add(position_key(row))
+
+if not ril_names:
+    sys.exit("No NAM/WNAM RIL names found in the family file.")
+
+counts = Counter()
+absent_positions = 0
+examples_printed = 0
+
+with open(merged_file, newline="") as handle:
+    reader = csv.reader(handle, delimiter="\t")
+    header = next(reader)
+
+    missing_samples = ril_names - set(header[11:])
+    if missing_samples:
+        sys.exit(
+            "Family RILs missing from merged header: "
+            + ", ".join(sorted(missing_samples))
+        )
+
+    columns = [
+        i for i in range(11, len(header))
+        if header[i] in ril_names
+    ]
+
+    print(f"Family RILs checked: {len(columns)}")
+    print("\nExamples: positions absent from this family input")
+    print("Marker\tChromosome\tPosition\tMissing_calls\tNonmissing_calls")
+
+    for row in reader:
+        if not row:
+            continue
+
+        if len(row) != len(header):
+            sys.exit(f"Column mismatch at marker {row[0]}")
+
+        if position_key(row) in family_positions:
+            continue
+
+        absent_positions += 1
+
+        calls = [row[i].strip().upper() for i in columns]
+        missing = sum(call in missing_codes for call in calls)
+        nonmissing = len(calls) - missing
+
+        counts.update(calls)
+
+        if examples_printed < 10:
+            print(
+                f"{row[0]}\t{row[2]}\t{row[3]}\t"
+                f"{missing}\t{nonmissing}"
+            )
+            examples_printed += 1
+
+total = sum(counts.values())
+missing_total = sum(
+    number for call, number in counts.items()
+    if call in missing_codes
+)
+
+print(f"\nPositions absent from family input: {absent_positions}")
+print(f"Genotype entries checked: {total}")
+print(f"Call counts: {dict(sorted(counts.items()))}")
+
+if total:
+    print(f"Missing entries: {100 * missing_total / total:.2f}%")
+else:
+    print("No absent positions found; this comparison is uninformative.")
