@@ -1,0 +1,123 @@
+library(ggplot2)
+
+outdir <- "GBS_vs_projected_results_2018"
+
+results_df <- read.csv(
+  file.path(outdir, "GBS_vs_projected_prediction_summary.csv")
+)
+
+panel_order <- c(
+  "GBS_only", "Projected_1k", "Projected_2k",
+  "Projected_5k", "Projected_10k",
+  "Projected_20k", "Projected_40k"
+)
+
+results_df$Panel <- factor(results_df$Panel, levels = panel_order)
+
+results_df$Trait <- factor(
+  results_df$Trait,
+  levels = c(
+    "DTH", "CL", "PL", "PRL", "PN", "PW",
+    "SW", "NPB", "NSPP", "BM", "SSR"
+  )
+)
+
+results_df$Model <- factor(
+  results_df$Model,
+  levels = c("rrBLUP", "RKHS", "BayesB", "BL")
+)
+
+p <- ggplot(
+  results_df,
+  aes(
+    x = Panel, y = Mean_Accuracy,
+    color = Model, group = Model
+  )
+) +
+  # Separate the GBS baseline from the projected density series.
+  geom_vline(
+    xintercept = 1.5,
+    linetype = "dotted",
+    linewidth = 0.3,
+    color = "gray60"
+  ) +
+  geom_line(linewidth = 0.3) +
+  geom_point(size = 0.8) +
+  geom_errorbar(
+    aes(
+      ymin = Mean_Accuracy - SD_Accuracy,
+      ymax = Mean_Accuracy + SD_Accuracy
+    ),
+    width = 0.12,
+    linewidth = 0.2,
+    alpha = 0.55
+  ) +
+  facet_wrap(~Trait, ncol = 4) +
+  scale_x_discrete(labels = c(
+    "GBS", "1k", "2k", "5k", "10k", "20k", "40k"
+  )) +
+  scale_color_manual(
+    values = c(
+      rrBLUP = "#0072B2",
+      RKHS = "#009E73",
+      BayesB = "#D55E00",
+      BL = "#CC79A7"
+    ),
+    labels = c("rrBLUP", "RKHS", "BayesB", "BL*")
+  ) +
+  labs(
+    x = "Marker panel (projected panels: nominal density)",
+    y = "Predictive ability (Pearson r)",
+    color = "Model",
+    caption = "*BL results provisional: numerical sampling warnings."
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    strip.text = element_text(face = "bold", size = 9),
+    strip.background = element_blank(),
+    panel.border = element_rect(
+      color = "black", fill = NA, linewidth = 0.35
+    ),
+    axis.text.x = element_text(
+      size = 6, angle = 45, hjust = 1
+    ),
+    axis.text.y = element_text(size = 7),
+    axis.title = element_text(size = 9),
+    axis.line = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 8),
+    plot.caption = element_text(size = 7, hjust = 0),
+    plot.margin = margin(4, 4, 4, 4)
+  ) +
+  guides(
+    color = guide_legend(
+      nrow = 1,
+      override.aes = list(size = 1.5)
+    )
+  )
+
+# Explicit R graphics devices bypass automatic PNG-device selection.
+ggsave(
+  file.path(outdir, "GBS_vs_projected_all_models_compact.pdf"),
+  plot = p,
+  device = grDevices::pdf,
+  width = 6.8,
+  height = 5.0,
+  units = "in"
+)
+
+if (!capabilities("cairo")) {
+  stop("PDF saved; Cairo support is required for this PNG export.")
+}
+
+ggsave(
+  file.path(outdir, "GBS_vs_projected_all_models_compact.png"),
+  plot = p,
+  device = grDevices::png,
+  type = "cairo",
+  width = 6.8,
+  height = 5.0,
+  units = "in",
+  dpi = 300
+)
