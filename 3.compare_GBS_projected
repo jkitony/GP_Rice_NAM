@@ -1,0 +1,821 @@
+rm(list = ls())
+
+###############################################################################
+# Genomic prediction: GBS-only versus projected marker-density panels
+#
+# Required packages:
+#   rrBLUP, BGLR, vcfR, dplyr, ggplot2
+#
+# Inputs:
+#   1. Phenotype table containing Genotype, Year and trait columns.
+#   2. GBS-only VCF and six projected-panel VCFs.
+#
+# Comparison design:
+#   - Same individuals across every panel.
+#   - Same trait-specific cross-validation folds across panels and models.
+#   - Retain biallelic SNPs with <=50% missingness in the common population.
+#   - Remove globally monomorphic markers.
+#   - Mean-impute residual missing calls using training individuals per fold.
+#   - Remove markers without variation in the training set.
+#
+# Models:
+#   rrBLUP: marker-effect ridge regression.
+#   RKHS: Gaussian kernel.
+#   BayesB and Bayesian LASSO: fitted using BGLR.
+#
+# Notes:
+#   Within-family FSFHap imputation has already been performed upstream.
+#   This script does not repeat FSFHap.
+#   BGLR chain length must be checked for convergence before publication.
+#   Runs sequentially; no unused parallel cluster is created.
+###############################################################################
+
+required_packages <- c(
+  "rrBLUP", "BGLR", "vcfR", "dplyr", "ggplot2"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages)) {
+  stop(
+    "Install missing packages: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(dplyr)
+library(ggplot2)
+
+###############################################################################
+# 1. Settings
+###############################################################################
+
+pheno_file <- "semitrimmed_pheno.txt"
+
+vcf_files <- c(
+  GBS_only = paste0(
+    "NAM_GBS_only_imputed.vcf"
+  ),
+  Projected_1k  = "Fourteen_projected_1k.vcf",
+  Projected_2k  = "Fourteen_projected_2k.vcf",
+  Projected_5k  = "Fourteen_projected_5k.vcf",
+  Projected_10k = "Fourteen_projected_10k.vcf",
+  Projected_20k = "Fourteen_projected_20k.vcf",
+  Projected_40k = "Fourteen_projected_40k.vcf"
+)
+
+panel_order <- names(vcf_files)
+
+panel_labels <- c(
+  GBS_only = "GBS only",
+  Projected_1k = "1k",
+  Projected_2k = "2k",
+  Projected_5k = "5k",
+  Projected_10k = "10k",
+  Projected_20k = "20k",
+  Projected_40k = "40k"
+)
+
+trait_order <- c(
+  "DTH", "CL", "PL", "PRL", "PN", "PW",
+  "SW", "NPB", "NSPP", "BM", "SSR"
+)
+
+model_order <- c("rrBLUP", "RKHS", "BayesB", "BL")
+
+outdir <- "GBS_vs_projected_results_2018"
+
+year_to_use <- 18
+max_missing <- 0.50
+n_folds <- 5
+cv_seed <- 723641600
+
+# Starting settings, not a guarantee of MCMC convergence.
+n_iter <- 12000
+burn_in <- 2000
+thin <- 5
+
+# Gaussian-kernel bandwidth.
+kernel_h <- 0.5
+
+if (burn_in >= n_iter) {
+  stop("burn_in must be smaller than n_iter.")
+}
+
+input_files <- c(pheno_file, unname(vcf_files))
+
+if (any(!file.exists(input_files))) {
+  stop(
+    "Missing input files:\n",
+    paste(input_files[!file.exists(input_files)], collapse = "\n")
+  )
+}
+
+if (dir.exists(outdir)) {
+  stop("Output directory already exists. Choose a new outdir.")
+}
+
+dir.create(outdir, recursive = TRUE)
+dir.create(file.path(outdir, "BGLR_traces"))
+
+###############################################################################
+# 2. Read VCF and encode genotypes
+#
+# Rows: individuals.
+# Columns: markers.
+# Coding: 0/0 = -1, heterozygous = 0, 1/1 = 1.
+###############################################################################
+
+read_marker_panel <- function(path) {
+  
+  vcf <- vcfR::read.vcfR(path, verbose = FALSE)
+  
+  keep <- (
+    vcf@fix[, "REF"] %in% c("A", "C", "G", "T") &
+      vcf@fix[, "ALT"] %in% c("A", "C", "G", "T") &
+      vcf@fix[, "REF"] != vcf@fix[, "ALT"]
+  )
+  
+  if (!any(keep)) {
+    stop("No biallelic SNPs in: ", path)
+  }
+  
+  gt <- vcfR::extract.gt(vcf, element = "GT")[keep, , drop = FALSE]
+  positions <- vcf@fix[keep, c("CHROM", "POS"), drop = FALSE]
+  
+  coordinates <- paste(
+    positions[, "CHROM"], positions[, "POS"], sep = ":"
+  )
+  
+  if (anyDuplicated(coordinates)) {
+    stop("Duplicate biallelic SNP coordinates in: ", path)
+  }
+  
+  supported <- c(
+    "0/0", "0|0", "0/1", "1/0", "0|1", "1|0", "1/1", "1|1",
+    ".", "./.", ".|."
+  )
+  
+  unexpected <- unique(
+    as.vector(gt)[!is.na(as.vector(gt)) &
+                    !(as.vector(gt) %in% supported)]
+  )
+  
+  if (length(unexpected)) {
+    stop(
+      "Unsupported GT encoding in ", path, ": ",
+      paste(head(unexpected), collapse = ", ")
+    )
+  }
+  
+  scores <- matrix(
+    NA_real_,
+    nrow = nrow(gt),
+    ncol = ncol(gt),
+    dimnames = dimnames(gt)
+  )
+  
+  scores[gt %in% c("0/0", "0|0")] <- -1
+  scores[gt %in% c("0/1", "1/0", "0|1", "1|0")] <- 0
+  scores[gt %in% c("1/1", "1|1")] <- 1
+  
+  X <- t(scores)
+  colnames(X) <- coordinates
+  
+  if (is.null(rownames(X)) || anyDuplicated(rownames(X))) {
+    stop("Missing or duplicate VCF sample names: ", path)
+  }
+  
+  X
+}
+
+###############################################################################
+# 3. Read phenotypes and identify the common individuals
+###############################################################################
+
+pheno <- read.table(
+  pheno_file,
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE,
+  na.strings = c("NA", "NaN", ".")
+)
+
+if (!all(c("Genotype", "Year") %in% names(pheno))) {
+  stop("Phenotypes must contain Genotype and Year columns.")
+}
+
+pheno <- pheno[
+  !is.na(pheno$Year) & pheno$Year == year_to_use,
+  ,
+  drop = FALSE
+]
+
+pheno$Genotype <- as.character(pheno$Genotype)
+
+if (anyNA(pheno$Genotype) || anyDuplicated(pheno$Genotype)) {
+  stop("Missing or duplicate Genotype identifiers in selected-year phenotypes.")
+}
+
+missing_traits <- setdiff(trait_order, names(pheno))
+
+if (length(missing_traits)) {
+  stop("Missing phenotype traits: ", paste(missing_traits, collapse = ", "))
+}
+
+for (trait in trait_order) {
+  if (!is.numeric(pheno[[trait]])) {
+    stop("Trait must be numeric: ", trait)
+  }
+  pheno[[trait]][!is.finite(pheno[[trait]])] <- NA_real_
+}
+
+panels <- lapply(vcf_files, read_marker_panel)
+
+common_ids <- sort(Reduce(
+  intersect,
+  c(list(pheno$Genotype), lapply(panels, rownames))
+))
+
+if (length(common_ids) < 2 * n_folds) {
+  stop("Too few individuals shared by all panels and phenotypes.")
+}
+
+pheno <- pheno[
+  match(common_ids, pheno$Genotype),
+  ,
+  drop = FALSE
+]
+
+stopifnot(identical(pheno$Genotype, common_ids))
+
+write.csv(
+  data.frame(Genotype = common_ids),
+  file.path(outdir, "common_individuals.csv"),
+  row.names = FALSE
+)
+
+cat("Common individuals:", length(common_ids), "\n")
+
+###############################################################################
+# 4. Filter each panel on the common population
+#
+# Filtering uses genotype data only.
+# All-missing and globally monomorphic markers are removed.
+###############################################################################
+
+panel_qc <- list()
+
+for (panel_name in panel_order) {
+  
+  X <- panels[[panel_name]][common_ids, , drop = FALSE]
+  
+  p_before <- ncol(X)
+  missing_before <- mean(is.na(X))
+  
+  missing_by_marker <- colMeans(is.na(X))
+  
+  keep_missing <- (
+    missing_by_marker <= max_missing &
+      missing_by_marker < 1
+  )
+  
+  X <- X[, keep_missing, drop = FALSE]
+  p_after_missing <- ncol(X)
+  
+  if (p_after_missing == 0) {
+    stop("No markers pass the missingness filter: ", panel_name)
+  }
+  
+  variable <- apply(
+    X, 2,
+    function(z) length(unique(z[!is.na(z)])) > 1
+  )
+  
+  X <- X[, variable, drop = FALSE]
+  
+  if (ncol(X) == 0) {
+    stop("No variable markers remain: ", panel_name)
+  }
+  
+  panel_qc[[panel_name]] <- data.frame(
+    Panel = panel_name,
+    Individuals = nrow(X),
+    Biallelic_SNPs_before_filtering = p_before,
+    Missing_percent_before_filtering = 100 * missing_before,
+    Markers_after_missingness_filter = p_after_missing,
+    Markers_after_global_QC = ncol(X),
+    Missing_percent_after_global_QC = 100 * mean(is.na(X))
+  )
+  
+  panels[[panel_name]] <- X
+  
+  cat(
+    panel_name, ":",
+    p_before, "markers before filtering;",
+    ncol(X), "after global QC\n"
+  )
+}
+
+write.csv(
+  bind_rows(panel_qc),
+  file.path(outdir, "panel_marker_counts_and_missingness.csv"),
+  row.names = FALSE
+)
+
+###############################################################################
+# 5. Generate trait-specific folds ONCE
+#
+# These reproduce the original random-fold design, rather than introducing
+# a different family-stratified cross-validation design.
+###############################################################################
+
+set.seed(cv_seed)
+
+folds <- list()
+fold_tables <- list()
+
+for (trait in trait_order) {
+  
+  observed <- which(!is.na(pheno[[trait]]))
+  
+  if (length(observed) < 2 * n_folds) {
+    stop("Too few phenotyped individuals for trait: ", trait)
+  }
+  
+  fold_assignment <- sample(
+    rep(seq_len(n_folds), length.out = length(observed))
+  )
+  
+  folds[[trait]] <- list(
+    rows = observed,
+    assignment = fold_assignment
+  )
+  
+  fold_tables[[trait]] <- data.frame(
+    Trait = trait,
+    Genotype = pheno$Genotype[observed],
+    Fold = fold_assignment
+  )
+}
+
+write.csv(
+  bind_rows(fold_tables),
+  file.path(outdir, "fixed_trait_folds.csv"),
+  row.names = FALSE
+)
+
+saveRDS(folds, file.path(outdir, "fixed_trait_folds.rds"))
+
+###############################################################################
+# 6. Training-based residual imputation
+#
+# Marker means and variation are estimated from training individuals only.
+# Test genotypes are imputed and centered using those training means.
+###############################################################################
+
+prepare_fold_genotypes <- function(X, train) {
+  
+  training_means <- colMeans(X[train, , drop = FALSE], na.rm = TRUE)
+  
+  training_sd <- apply(
+    X[train, , drop = FALSE],
+    2,
+    sd,
+    na.rm = TRUE
+  )
+  
+  keep <- (
+    is.finite(training_means) &
+      is.finite(training_sd) &
+      training_sd > 0
+  )
+  
+  if (!any(keep)) {
+    stop("No markers vary in the training set.")
+  }
+  
+  Z <- X[, keep, drop = FALSE]
+  means <- training_means[keep]
+  
+  for (j in seq_len(ncol(Z))) {
+    Z[is.na(Z[, j]), j] <- means[j]
+  }
+  
+  # Center both training and test genotypes using training means.
+  Z <- sweep(Z, 2, means, FUN = "-")
+  
+  stopifnot(all(is.finite(Z)))
+  
+  Z
+}
+
+safe_cor <- function(observed, predicted) {
+  
+  keep <- is.finite(observed) & is.finite(predicted)
+  
+  if (
+    sum(keep) < 3 ||
+    sd(observed[keep]) == 0 ||
+    sd(predicted[keep]) == 0
+  ) {
+    return(NA_real_)
+  }
+  
+  cor(observed[keep], predicted[keep])
+}
+
+###############################################################################
+# 7. Run all models on identical folds
+#
+# Bayesian traces are retained under BGLR_traces for convergence assessment.
+# Intermediate fold results are saved after each fold.
+###############################################################################
+
+fold_results <- list()
+predictions <- list()
+result_index <- 0L
+
+for (panel_name in panel_order) {
+  
+  cat("\nPanel:", panel_name, "\n")
+  
+  for (trait_index in seq_along(trait_order)) {
+    
+    trait <- trait_order[trait_index]
+    info <- folds[[trait]]
+    
+    y <- pheno[[trait]][info$rows]
+    ids <- pheno$Genotype[info$rows]
+    
+    X <- panels[[panel_name]][info$rows, , drop = FALSE]
+    
+    for (fold in seq_len(n_folds)) {
+      
+      test <- which(info$assignment == fold)
+      train <- which(info$assignment != fold)
+      
+      Z <- prepare_fold_genotypes(X, train)
+      p_used <- ncol(Z)
+      
+      # Same genotypes, imputation and retained markers for all four models.
+      D <- as.matrix(dist(Z))^2 / p_used
+      U <- exp(-kernel_h * D)
+      
+      for (model_index in seq_along(model_order)) {
+        
+        model <- model_order[model_index]
+        
+        cat(
+          " ", trait, "| fold", fold, "|", model,
+          "| markers:", p_used, "\n"
+        )
+        
+        # Match stochastic seeds across panels for a given trait/fold/model.
+        fit_seed <- cv_seed +
+          trait_index * 1000L + fold * 10L + model_index
+        
+        set.seed(fit_seed)
+        
+        if (model == "rrBLUP") {
+          
+          fit <- rrBLUP::mixed.solve(
+            y = y[train],
+            Z = Z[train, , drop = FALSE]
+          )
+          
+          yhat <- as.numeric(
+            fit$beta[1] +
+              Z[test, , drop = FALSE] %*% fit$u
+          )
+          
+        } else {
+          
+          y_masked <- y
+          y_masked[test] <- NA_real_
+          
+          ETA <- switch(
+            model,
+            RKHS = list(list(K = U, model = "RKHS")),
+            BayesB = list(list(X = Z, model = "BayesB")),
+            BL = list(list(X = Z, model = "BL"))
+          )
+          
+          trace_prefix <- paste0(
+            file.path(
+              outdir,
+              "BGLR_traces",
+              paste(panel_name, trait, model, fold, sep = "_")
+            ),
+            "_"
+          )
+          
+          fit <- BGLR::BGLR(
+            y = y_masked,
+            ETA = ETA,
+            nIter = n_iter,
+            burnIn = burn_in,
+            thin = thin,
+            saveAt = trace_prefix,
+            verbose = FALSE
+          )
+          
+          yhat <- as.numeric(fit$yHat[test])
+        }
+        
+        result_index <- result_index + 1L
+        
+        fold_results[[result_index]] <- data.frame(
+          Panel = panel_name,
+          Trait = trait,
+          Model = model,
+          Fold = fold,
+          Seed = fit_seed,
+          N_training = length(train),
+          N_test = length(test),
+          Markers_used = p_used,
+          Predictive_ability = safe_cor(y[test], yhat)
+        )
+        
+        predictions[[result_index]] <- data.frame(
+          Panel = panel_name,
+          Trait = trait,
+          Model = model,
+          Fold = fold,
+          Genotype = ids[test],
+          Observed = y[test],
+          Predicted = yhat
+        )
+      }
+      
+      write.csv(
+        bind_rows(fold_results),
+        file.path(outdir, "fold_results_checkpoint.csv"),
+        row.names = FALSE
+      )
+    }
+  }
+}
+
+fold_df <- bind_rows(fold_results)
+prediction_df <- bind_rows(predictions)
+
+write.csv(
+  fold_df,
+  file.path(outdir, "prediction_accuracy_by_fold.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  prediction_df,
+  file.path(outdir, "out_of_fold_predictions.csv"),
+  row.names = FALSE
+)
+
+###############################################################################
+# 8. Summarize predictive ability
+#
+# SD across folds describes fold-to-fold variation.
+# It is not an independent-sample confidence interval.
+###############################################################################
+
+results_df <- fold_df %>%
+  group_by(Panel, Trait, Model) %>%
+  summarise(
+    N_used = sum(N_test),
+    Markers_used_min = min(Markers_used),
+    Markers_used_max = max(Markers_used),
+    Valid_folds = sum(is.finite(Predictive_ability)),
+    Mean_Accuracy = if (
+      any(is.finite(Predictive_ability))
+    ) mean(Predictive_ability, na.rm = TRUE) else NA_real_,
+    SD_Accuracy = sd(Predictive_ability, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  results_df,
+  file.path(outdir, "GBS_vs_projected_prediction_summary.csv"),
+  row.names = FALSE
+)
+
+# Paired differences: same trait, model, individuals and validation fold.
+baseline <- fold_df %>%
+  filter(Panel == "GBS_only") %>%
+  select(
+    Trait, Model, Fold,
+    GBS_accuracy = Predictive_ability
+  )
+
+paired <- fold_df %>%
+  left_join(baseline, by = c("Trait", "Model", "Fold")) %>%
+  mutate(
+    Difference_from_GBS = Predictive_ability - GBS_accuracy
+  )
+
+write.csv(
+  paired,
+  file.path(outdir, "paired_fold_differences_from_GBS.csv"),
+  row.names = FALSE
+)
+
+difference_summary <- paired %>%
+  group_by(Panel, Trait, Model) %>%
+  summarise(
+    Mean_difference = if (
+      any(is.finite(Difference_from_GBS))
+    ) mean(Difference_from_GBS, na.rm = TRUE) else NA_real_,
+    SD_difference = sd(Difference_from_GBS, na.rm = TRUE),
+    Valid_pairs = sum(is.finite(Difference_from_GBS)),
+    .groups = "drop"
+  )
+
+write.csv(
+  difference_summary,
+  file.path(outdir, "prediction_difference_from_GBS_summary.csv"),
+  row.names = FALSE
+)
+
+###############################################################################
+# 9. Plot trait-specific predictive ability
+###############################################################################
+
+results_df <- results_df %>%
+  mutate(
+    Panel = factor(Panel, levels = panel_order),
+    Trait = factor(Trait, levels = trait_order),
+    Model = factor(Model, levels = model_order)
+  )
+
+p_trait <- ggplot(
+  results_df,
+  aes(
+    x = Panel, y = Mean_Accuracy,
+    color = Model, group = Model
+  )
+) +
+  geom_line(linewidth = 0.4, na.rm = TRUE) +
+  geom_point(size = 1.4, na.rm = TRUE) +
+  facet_wrap(~Trait, ncol = 4) +
+  scale_x_discrete(labels = panel_labels) +
+  labs(
+    x = "Marker panel",
+    y = "Predictive ability (Pearson r)",
+    color = "Model"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  )
+
+###############################################################################
+# 10. Plot paired differences relative to GBS-only
+###############################################################################
+
+difference_plot_data <- difference_summary %>%
+  filter(Panel != "GBS_only") %>%
+  mutate(
+    Panel = factor(Panel, levels = panel_order[-1]),
+    Trait = factor(Trait, levels = trait_order),
+    Model = factor(Model, levels = model_order)
+  )
+
+p_difference <- ggplot(
+  difference_plot_data,
+  aes(
+    x = Panel, y = Mean_difference,
+    color = Model, group = Model
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "gray45"
+  ) +
+  geom_line(linewidth = 0.4, na.rm = TRUE) +
+  geom_point(size = 1.4, na.rm = TRUE) +
+  facet_wrap(~Trait, ncol = 4) +
+  scale_x_discrete(labels = panel_labels) +
+  labs(
+    x = "Projected marker panel",
+    y = "Difference in predictive ability\n(projected minus GBS-only)",
+    color = "Model"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  )
+
+###############################################################################
+# 11. Descriptive average across traits
+#
+# Traits are different outcomes, not independent experimental replicates.
+# Therefore, do not interpret their spread as a test of panel superiority.
+###############################################################################
+
+overall <- results_df %>%
+  group_by(Panel, Model) %>%
+  summarise(
+    Traits_with_results = sum(is.finite(Mean_Accuracy)),
+    Mean_across_traits = if (
+      any(is.finite(Mean_Accuracy))
+    ) mean(Mean_Accuracy, na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  )
+
+write.csv(
+  overall,
+  file.path(outdir, "descriptive_mean_across_traits.csv"),
+  row.names = FALSE
+)
+
+p_overall <- ggplot(
+  overall,
+  aes(
+    x = Panel, y = Mean_across_traits,
+    color = Model, group = Model
+  )
+) +
+  geom_line(linewidth = 0.5, na.rm = TRUE) +
+  geom_point(size = 2, na.rm = TRUE) +
+  scale_x_discrete(labels = panel_labels) +
+  labs(
+    x = "Marker panel",
+    y = "Mean predictive ability across traits",
+    color = "Model"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+###############################################################################
+# 12. Save PDF and PNG figures
+###############################################################################
+
+save_figure <- function(plot, name, width, height) {
+  
+  ggsave(
+    file.path(outdir, paste0(name, ".pdf")),
+    plot = plot,
+    width = width,
+    height = height
+  )
+  
+  ggsave(
+    file.path(outdir, paste0(name, ".png")),
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+}
+
+save_figure(
+  p_trait, "GBS_vs_projected_traitwise", 10, 7
+)
+
+save_figure(
+  p_difference, "Projected_minus_GBS_traitwise", 10, 7
+)
+
+save_figure(
+  p_overall, "GBS_vs_projected_overall", 7, 4.5
+)
+
+###############################################################################
+# 13. Save settings and software information
+###############################################################################
+
+saveRDS(
+  list(
+    phenotype_file = pheno_file,
+    vcf_files = vcf_files,
+    year = year_to_use,
+    max_missing = max_missing,
+    n_folds = n_folds,
+    cv_seed = cv_seed,
+    n_iter = n_iter,
+    burn_in = burn_in,
+    thin = thin,
+    kernel_h = kernel_h,
+    common_individuals = common_ids,
+    imputation = "Training-fold marker means",
+    rrBLUP_model = "Marker-effect ridge regression"
+  ),
+  file.path(outdir, "analysis_settings.rds")
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(outdir, "sessionInfo.txt")
+)
+
+cat("\nCompleted. Results saved in:", outdir, "\n")
